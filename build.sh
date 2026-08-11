@@ -14,10 +14,6 @@ CODESIGN_ARGS=(
     --sign "$SIGN_IDENTITY"
     --options runtime
 )
-if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
-    CODESIGN_ARGS+=(--timestamp)
-fi
-
 REQUIRED_TOOLS=(
     oxipng
     pngquant
