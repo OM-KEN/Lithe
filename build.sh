@@ -9,6 +9,14 @@ RESOURCES_DIR="$APP_BUNDLE/Contents/Resources"
 APP_EXECUTABLE="$(pwd -P)/$MACOS_DIR/$APP_NAME"
 VERSION=$(tr -d '[:space:]' < VERSION)
 SIGN_IDENTITY=${LITHE_SIGN_IDENTITY:--}
+CODESIGN_ARGS=(
+    --force
+    --sign "$SIGN_IDENTITY"
+    --options runtime
+)
+if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
+    CODESIGN_ARGS+=(--timestamp)
+fi
 
 REQUIRED_TOOLS=(
     oxipng
@@ -151,10 +159,10 @@ for tool in "${REQUIRED_TOOLS[@]}"; do
     source_tool="Vendor/bin/$tool"
     destination="$RESOURCES_DIR/Tools/$tool"
     cp "$source_tool" "$destination"
-    codesign --force --sign "$SIGN_IDENTITY" --options runtime "$destination"
+    codesign "${CODESIGN_ARGS[@]}" "$destination"
 done
 
-codesign --force --sign "$SIGN_IDENTITY" --options runtime "$APP_BUNDLE"
+codesign "${CODESIGN_ARGS[@]}" "$APP_BUNDLE"
 
 for tool in "${REQUIRED_TOOLS[@]}"; do
     embedded_tool="$RESOURCES_DIR/Tools/$tool"

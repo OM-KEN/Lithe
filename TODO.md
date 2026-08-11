@@ -14,9 +14,9 @@ This file tracks confirmed unfinished work, not promised release dates.<br>
 - [ ] Let eligible `无需压缩` items enter the inspector and try advanced quality levels without losing the original or last valid result.
 - [ ] Add regression coverage for externally optimized JPEGs, partial candidate failures, and review-state navigation.
 
-## Before the First Public Binary / 首个公开安装包之前
+## Distribution Hardening / 分发强化
 
 - [ ] Complete hands-on validation for multi-display positioning, drag-out conflicts, ZIP, Trash/Undo, and Copied round trips.
 - [ ] Measure launch and compression latency against the MVP performance targets.
-- [ ] Sign with Developer ID, notarize the app, and verify the downloadable archive on a clean Mac.
+- [ ] Replace the current Apple Development release signature with Developer ID, notarize the DMG, and verify it on a clean Mac with Gatekeeper enabled.
 - [ ] Recheck GPL corresponding-source materials and every bundled dependency notice for the exact release build.
