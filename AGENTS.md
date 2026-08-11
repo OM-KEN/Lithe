@@ -8,6 +8,7 @@ Lithe is a macOS 14+ Swift utility built with AppKit and SwiftUI. Production sou
 
 - `./run-tests.sh` compiles the custom Swift test executable, runs core regression tests, and smoke-tests all four bundled codecs, architectures, and dynamic dependencies.
 - `./build.sh` builds, signs, and verifies the arm64+x86_64 app at `.build/Lithe.app`. Close any running copy from that path first.
+- `./package-dmg.sh` builds and verifies a versioned DMG; `--release` requires Apple signing and notarizes when Developer ID credentials are provided.
 - `LITHE_SIGN_IDENTITY="Developer ID Application: …" ./build.sh` creates a Developer ID-signed build; the default is ad-hoc signing.
 - `./vendor-<tool>.sh` reproducibly rebuilds one bundled codec from pinned upstream inputs. Do not use these scripts for ordinary app builds.
 
