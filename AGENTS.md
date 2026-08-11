@@ -24,6 +24,6 @@ Use four-space indentation. Name types in `UpperCamelCase`, members and enum cas
 
 Tests use a small custom runner rather than XCTest. Add descriptive `lowerCamelCase` regression methods to `Tests/CoreTests.swift`, invoke them from `CoreTests.main`, and exercise the production path. Run `./run-tests.sh` for every change and `./build.sh` for source, resource, signing, or dependency changes. Include manual screenshots for visible panel or inspector changes.
 
-## Commit & Pull Request Guidelines
+## Commit & Release Guidelines
 
-Use short imperative subjects, preferably scoped (for example, `fix: preserve JPEG density`). Keep commits single-purpose. Pull requests should explain behavior, list verification commands, link relevant issues, include UI screenshots when applicable, and document any codec or license changes. Do not push without maintainer approval.
+Load `.agents/skills/lithe-release/SKILL.md` before any staging, commit, push, tag, version, or GitHub Release operation. Lithe normally uses a direct `main` workflow: do not create a worktree, branch, pull request, pull, or rebase unless the maintainer explicitly asks. Use short imperative subjects (for example, `fix: preserve JPEG density`) and keep commits single-purpose. Never push or publish a release without maintainer approval.
