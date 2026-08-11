@@ -1,4 +1,0 @@
-interface:
-  display_name: "Lithe Release"
-  short_description: "Commit, push, and publish Lithe releases directly"
-  default_prompt: "Use $lithe-release to commit and push Lithe changes, and publish a GitHub release when requested."
