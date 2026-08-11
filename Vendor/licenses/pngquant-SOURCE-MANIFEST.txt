@@ -1,0 +1,48 @@
+pngquant universal macOS vendor build provenance
+================================================
+
+Built artifact: pngquant 3.0.3 for arm64 + x86_64, macOS 14.0+
+
+pngquant official crates.io distribution
+URL: https://static.crates.io/crates/pngquant/pngquant-3.0.3.crate
+SHA-256: 68a12bdd8825f9989f4ee9a6ab0b42727dae57728b939ef63453366697a07232
+Published crate VCS commit: 2e953d9cbc282393022038673856623dcbeb389a
+Same-version Git tag object: 1da7ec020e603ac1ed531931a36275a47521a66f
+Same-version Git tag target: 53a332a58f44357b6b41842a54d74aa1e245913d
+Note: the official crate was published from a later MSRV-fix commit than the
+same-version Git tag. This build uses the checksummed crates.io distribution.
+
+libpng official source
+Version: 1.6.58
+URL: https://download.sourceforge.net/project/libpng/libpng16/1.6.58/libpng-1.6.58.tar.gz
+SHA-256: 8c9b05b675ca7301a458df2c2e46f26e1d41ff36b8863f8c33530bc58c2e6225
+Verified Git tag object: fdc7185dfedbddce8c2487bc171f66af4fca24ab
+Git tag target: 3061454d980de7d53608f594194cfac722721d2a
+
+Little CMS official release asset
+Version: 2.19.1
+URL: https://github.com/mm2/Little-CMS/releases/download/lcms2.19.1/lcms2-2.19.1.tar.gz
+SHA-256: bfc54f7bab59fbc921012014a8032e4cba4abd46db47d46b76416a8c0b2815c8
+Git tag target: 21c582a594fe5279f90c0b93437c398f93bf62b0
+
+Official Rust toolchain
+Version: 1.85.1
+Manifest: https://static.rust-lang.org/dist/channel-rust-1.85.1.toml
+Manifest SHA-256: 1e7dae690cd12e27405a97e64704917489a27c650201bf47780a936055d67909
+rustc arm64 SHA-256: 93a6fd55cf1a88bb50e133c5bdb629197b80ad0ccab128ce3a84902992786b4c
+cargo arm64 SHA-256: 21edfaa6d97dd5eca08c50d2520d1a821e917be98d3515cbf00ddafd9001b634
+rust-std arm64 SHA-256: a066d9b033f5fc74283ca86e38da8178c201e86b17113e184383904573734a67
+rust-std x86_64 SHA-256: 30d3324771063f7923ad5fe0695a09d5097d07234415a84019fe91fca912cf23
+
+Rust dependencies
+The byte-for-byte upstream Cargo.lock is stored as pngquant-Cargo.lock.
+Cargo --locked verifies every downloaded crates.io archive against the checksum
+in that lockfile. Crate source URL pattern:
+https://static.crates.io/crates/{name}/{name}-{version}.crate
+
+Linkage decisions
+- libpng 1.6.58: statically linked from official source above.
+- Little CMS 2.19.1: statically linked from official source above.
+- libpng-sys 1.1.9: Rust FFI wrapper only; its bundled libpng 1.6.37 is not built.
+- libz-sys 1.1.12: Rust FFI wrapper only; its bundled zlib is not built.
+- zlib and iconv: macOS system dynamic libraries.

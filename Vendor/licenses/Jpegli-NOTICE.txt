@@ -1,0 +1,77 @@
+Jpegli cjpegli build notice
+===========================
+
+Lithe distributes a universal macOS cjpegli executable built from the
+official Google Jpegli repository at this immutable commit:
+
+  Project: https://github.com/google/jpegli
+  Commit: 031a0077f5799a6041004267fc12b956c1f52a20
+  Source: https://github.com/google/jpegli/archive/031a0077f5799a6041004267fc12b956c1f52a20.tar.gz
+  SHA-256: 269b3a75d6b2da2351f7fb2d642043f60f9b6d1bd5839f20c0d7c569be073367
+
+The build uses the dependency revisions pinned by that Jpegli commit. Only
+the dependencies needed for cjpegli with bundled PNG support and skcms are
+downloaded:
+
+  Highway
+  Project: https://github.com/google/highway
+  Commit: 271a9a0ed9de1232d9117f1572c3fe28f8542ec1
+  Source: https://github.com/google/highway/archive/271a9a0ed9de1232d9117f1572c3fe28f8542ec1.tar.gz
+  SHA-256: c42bcfe44d100223ea0043acb3da6de703103ca44bfb1d46b577c90939177f5f
+
+  skcms
+  Project: https://github.com/google/skcms
+  Commit: 96d9171c94b937a1b5f0293de7309ac16311b722
+  Source: https://github.com/google/skcms/archive/96d9171c94b937a1b5f0293de7309ac16311b722.tar.gz
+  SHA-256: 9bb4b5bba0b7c04f6c2bce9ff713d61e23c9a20c4945161ae16290498ad74627
+
+  zlib
+  Project: https://github.com/madler/zlib
+  Commit: 51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf
+  Source: https://github.com/madler/zlib/archive/51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf.tar.gz
+  SHA-256: d9e270d46252734aa49770fbc544125391617956266f220bd63216c834f3a522
+
+  libpng
+  Project: https://github.com/glennrp/libpng
+  Commit: 872555f4ba910252783af1507f9e7fe1653be252
+  Source: https://github.com/glennrp/libpng/archive/872555f4ba910252783af1507f9e7fe1653be252.tar.gz
+  SHA-256: f7ebcdc408a26d45244d9ef3d35d732a5482a77c55d1d40bf1eb748030691097
+
+  libjpeg-turbo compatibility source
+  Project: https://github.com/libjpeg-turbo/libjpeg-turbo
+  Commit: 8ecba3647edb6dd940463fedf38ca33a8e2a73d1
+  Source: https://github.com/libjpeg-turbo/libjpeg-turbo/archive/8ecba3647edb6dd940463fedf38ca33a8e2a73d1.tar.gz
+  SHA-256: ed729127097af5000bfeddc6b3e679c4363bb1618ebfc07efb6b47f576471b4b
+
+Jpegli's source archive also contains APNG Disassembler 2.8 source used by
+its image input layer. Its license is reproduced separately.
+
+The reproducible build downloads this build-only CMake release; CMake is not
+included in or distributed with the resulting executable:
+
+  CMake 3.27.9 macOS universal
+  Source: https://github.com/Kitware/CMake/releases/download/v3.27.9/cmake-3.27.9-macos-universal.tar.gz
+  SHA-256: ae1fdfd3f74864d0432f2e4a93ff6488125cd8f2869a40a1c2d5166feb6c607c
+
+Build properties
+----------------
+
+The arm64 and x86_64 slices are configured and built independently, then
+combined with Apple's lipo. Both slices target macOS 14.0. Jpegli, Highway,
+skcms, zlib, and libpng are linked statically. The resulting executable has
+no third-party dynamic-library dependency; its only dynamic dependencies are
+/usr/lib/libc++.1.dylib and /usr/lib/libSystem.B.dylib.
+
+The complete build and verification procedure is in vendor-jpegli.sh.
+
+License files
+-------------
+
+  Jpegli-LICENSE.txt
+  Jpegli-PATENTS.txt
+  Jpegli-apngdis-LICENSE.txt
+  Jpegli-Highway-LICENSE.txt
+  Jpegli-skcms-LICENSE.txt
+  Jpegli-zlib-LICENSE.txt
+  Jpegli-libpng-LICENSE.txt
+  Jpegli-libjpeg-turbo-LICENSE.md

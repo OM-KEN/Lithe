@@ -1,0 +1,2 @@
+LICENSE whitespace=-blank-at-eof
+Vendor/licenses/** -text whitespace=-trailing-space,-blank-at-eof
