@@ -2,52 +2,39 @@
 
 [English](README.md)
 
-Lithe 是一款轻量、可检查的 macOS 图片压缩工具。传入 JPG 或 PNG 后，它会自动保留安全、有效的结果；只有机器难以判断时，才需要你打开检查窗口进行比较。
+Lithe 是一款轻量的 macOS 图片压缩工具。它会自动压缩 JPG 和 PNG，需要时也可以打开检查窗口仔细比较结果。
 
-> 当前源码版本记录在 [`VERSION`](VERSION) 中。需要 macOS 14 或更高版本。
+[下载 Lithe 1.0.0](https://github.com/OM-KEN/Lithe/releases/download/v1.0.0/Lithe-1.0.0.dmg) · 需要 macOS 14 或更高版本
 
-## 亮点
+## 功能
 
-- 使用 Jpegli、pngquant、OxiPNG 和 jpegtran 压缩静态 JPG/PNG。
-- 不透明 PNG 会比较 PNG 与 JPEG，透明 PNG 始终保留透明度。
-- 检查窗口支持同步缩放和平移、三档快捷质量及 10 级高级调节。
-- 结果可拖出、在 Finder 中显示、打包 ZIP，或将合格原图移到废纸篓并在当前会话撤销。
-- 每次处理都先创建不可变快照，不会覆盖原图或用户修改过的输出。
+- 压缩静态 JPG 和 PNG 图片。
+- 为不透明 PNG 比较 PNG 与 JPEG 结果。
+- 在检查窗口中同步缩放和平移图片。
+- 使用三档快捷质量或 10 级高级调节。
+- 拖出结果、在 Finder 中显示、创建 ZIP，或将原图移到废纸篓并在当前会话撤销。
+- 通过不可变快照保护原图，始终以非破坏方式生成结果。
 
-## 安装与使用
+## 安装
 
-从 [Releases](https://github.com/OM-KEN/Lithe/releases) 下载最新版 DMG，打开后将 Lithe 拖入“应用程序”。可通过 Finder 的“打开方式”、Launch Services 或独立的 Copied 集成传入本地 JPG/PNG 文件。
+1. 打开下载的 DMG。
+2. 将 Lithe 拖入“应用程序”。
+3. 如果首次启动出现 macOS 提示，请右键 Lithe，选择“打开”。
 
-## 从源码构建
-
-安装 Xcode Command Line Tools 后执行：
+## 构建
 
 ```bash
 ./run-tests.sh
 ./build.sh
-```
-
-universal App 会生成在 `.build/Lithe.app`。仓库已包含全部编码工具，无需 Homebrew。
-
-## 版本与 DMG 打包
-
-`VERSION` 是唯一版本来源。`build.sh` 会把版本写入 App，`package-dmg.sh` 会生成 `.build/Lithe-<版本>.dmg` 及其 SHA-256 文件。
-
-```bash
 ./package-dmg.sh
 ```
 
-当前 GitHub 打包等级与 Copied 一致：App 使用 Apple Development 签名，DMG 尚未公证。因此部分 Mac 可能需要在 Finder 中右键选择“打开”。
-
-```bash
-LITHE_SIGN_IDENTITY="Apple Development: …" \
-./package-dmg.sh --release
-```
-
-如需标准公开分发，`--release` 也支持 Developer ID Application 与 `LITHE_NOTARY_PROFILE`；该路径会签名、公证并装订 DMG 票据。
-
-当前待办见 [TODO.md](TODO.md)，编码工具来源见 [Vendor/README.md](Vendor/README.md)。
+构建产物位于 `.build/`。当前版本记录在 [`VERSION`](VERSION) 中，后续计划见 [TODO.md](TODO.md)。
 
 ## 许可
 
-Lithe 以 [GPL-3.0-or-later](LICENSE) 开源。内嵌依赖的许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。Copied 是独立项目，不包含在本仓库中。
+Lithe 以 [GPL-3.0-or-later](LICENSE) 开源，内嵌依赖的许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 另一个项目
+
+[Copied](https://github.com/OM-KEN/Copied) 是一款完整、独立的 macOS 剪贴板助手，在复制后提供直观反馈和快捷操作。
