@@ -24,7 +24,7 @@ enum CompressionEngineError: LocalizedError {
     }
 }
 
-struct DecodedImage {
+struct DecodedImage: @unchecked Sendable {
     let image: CGImage
     let format: LitheImageFormat
     let hasTransparency: Bool
@@ -90,6 +90,64 @@ enum EmbeddedICCProfileDetector {
             offset += length
         }
         return false
+    }
+}
+
+enum PNGRenderingMetadataRestorer {
+    private struct Chunk {
+        let type: String
+        let range: Range<Int>
+    }
+
+    private static let signature = Data([137, 80, 78, 71, 13, 10, 26, 10])
+    private static let renderingChunkTypes: Set<String> = ["iCCP", "pHYs"]
+
+    static func restore(from sourceURL: URL, to outputURL: URL) throws {
+        let source = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
+        let output = try Data(contentsOf: outputURL, options: .mappedIfSafe)
+        let sourceChunks = try chunks(in: source)
+        let renderingChunks = sourceChunks.filter { renderingChunkTypes.contains($0.type) }
+        guard !renderingChunks.isEmpty else { return }
+
+        let outputChunks = try chunks(in: output)
+        var restored = Data(signature)
+        for chunk in outputChunks {
+            guard !renderingChunkTypes.contains(chunk.type) else { continue }
+            restored.append(output[chunk.range])
+            if chunk.type == "IHDR" {
+                for renderingChunk in renderingChunks {
+                    restored.append(source[renderingChunk.range])
+                }
+            }
+        }
+        try restored.write(to: outputURL, options: .atomic)
+    }
+
+    private static func chunks(in data: Data) throws -> [Chunk] {
+        guard data.count >= signature.count,
+              data.prefix(signature.count) == signature else {
+            throw CompressionEngineError.validationFailed("PNG 签名无效")
+        }
+        var chunks: [Chunk] = []
+        var offset = signature.count
+        while offset + 12 <= data.count {
+            let length = data[offset ..< offset + 4].reduce(0) { ($0 << 8) | Int($1) }
+            let end = offset + 12 + length
+            guard end <= data.count,
+                  let type = String(
+                    data: data[(offset + 4) ..< (offset + 8)],
+                    encoding: .ascii
+                  ) else {
+                throw CompressionEngineError.validationFailed("PNG 数据块无效")
+            }
+            chunks.append(Chunk(type: type, range: offset ..< end))
+            offset = end
+            if type == "IEND" { break }
+        }
+        guard chunks.last?.type == "IEND", offset == data.count else {
+            throw CompressionEngineError.validationFailed("PNG 数据不完整")
+        }
+        return chunks
     }
 }
 
@@ -159,33 +217,22 @@ enum ImageDecoder {
         let width = image.width
         let height = image.height
         guard width > 0, height > 0 else { return false }
-        let stripHeight = 256
-        for originY in stride(from: 0, to: height, by: stripHeight) {
-            let currentHeight = min(stripHeight, height - originY)
-            guard let strip = image.cropping(to: CGRect(
-                x: 0,
-                y: originY,
-                width: width,
-                height: currentHeight
-            )) else { return true }
-            var pixels = [UInt8](repeating: 0, count: width * currentHeight * 4)
+        var alpha = [UInt8](repeating: 0, count: width * height)
+        let rendered = alpha.withUnsafeMutableBytes { buffer -> Bool in
             guard let context = CGContext(
-                data: &pixels,
+                data: buffer.baseAddress,
                 width: width,
-                height: currentHeight,
+                height: height,
                 bitsPerComponent: 8,
-                bytesPerRow: width * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            ) else { return true }
-            context.draw(strip, in: CGRect(x: 0, y: 0, width: width, height: currentHeight))
-            var offset = 3
-            while offset < pixels.count {
-                if pixels[offset] < 255 { return true }
-                offset += 4
-            }
+                bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue
+            ) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
         }
-        return false
+        guard rendered else { return true }
+        return alpha.contains { $0 < 255 }
     }
 }
 
@@ -378,6 +425,35 @@ final class CompressionEngine: @unchecked Sendable {
         let generation: Int
     }
 
+    private struct CandidateBranchResult {
+        let candidates: [CompressionCandidate]
+        let selectedCandidateID: UUID?
+        let failures: [String]
+
+        var selectedCandidate: CompressionCandidate? {
+            selectedCandidateID.flatMap { selectedID in
+                candidates.first { $0.id == selectedID }
+            }
+        }
+    }
+
+    private final class CandidateBranchResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var result: Result<CandidateBranchResult, Error>?
+
+        func store(_ result: Result<CandidateBranchResult, Error>) {
+            lock.lock()
+            self.result = result
+            lock.unlock()
+        }
+
+        func load() -> Result<CandidateBranchResult, Error> {
+            lock.lock()
+            defer { lock.unlock() }
+            return result!
+        }
+    }
+
     let toolRunner: ToolRunner
     private let activeOperationLock = NSLock()
     private var activeOperation: OperationKey?
@@ -402,7 +478,19 @@ final class CompressionEngine: @unchecked Sendable {
         let decoded = try ImageDecoder.decode(snapshotURL)
         let originalBytes = try fileSize(snapshotURL)
         let quality = CompressionQuality.preset(preset)
-        var pngCandidate: CompressionCandidate?
+        let candidateFormats: [LitheImageFormat] = decoded.format == .jpeg
+            ? [.jpeg]
+            : (decoded.hasTransparency ? [.png] : [.png, .jpeg])
+        let toolInputURL = try toolInputIfNeeded(
+            decoded: decoded,
+            sourceURL: snapshotURL,
+            itemID: itemID,
+            operation: operation,
+            candidateFormats: candidateFormats,
+            fileStore: fileStore
+        )
+        var pngCandidates: [CompressionCandidate] = []
+        var selectedPNGCandidateID: UUID?
         var jpegCandidate: CompressionCandidate?
         var candidateFailures: [String] = []
 
@@ -417,6 +505,7 @@ final class CompressionEngine: @unchecked Sendable {
                     generation: generation,
                     format: .jpeg,
                     quality: quality,
+                    toolInputURL: toolInputURL,
                     variant: "lossy",
                     fileStore: fileStore
                 ))
@@ -451,64 +540,80 @@ final class CompressionEngine: @unchecked Sendable {
             }
             jpegCandidate = preferredCandidate(candidates, preset: preset)
         case .png:
-            var pngCandidates: [CompressionCandidate] = []
-            do {
-                pngCandidates.append(try makeCandidate(
+            if decoded.hasTransparency {
+                let pngBranch = try makePNGCandidateBranch(
                     decoded: decoded,
                     sourceURL: snapshotURL,
                     itemID: itemID,
                     generation: generation,
-                    format: .png,
                     quality: quality,
-                    variant: "lossy",
+                    toolInputURL: toolInputURL,
+                    originalBytes: originalBytes,
+                    preset: preset,
                     fileStore: fileStore
-                ))
-            } catch {
-                try propagateCancellation(error)
-                candidateFailures.append("PNG：\(error.localizedDescription)")
-            }
-            try throwIfCancelled(operation)
-            if pngCandidates.first.map({
-                !isAcceptable($0, originalBytes: originalBytes, preset: preset)
-            }) ?? true {
-                do {
-                    pngCandidates.append(try makeLosslessPNGCandidate(
-                        decoded: decoded,
-                        itemID: itemID,
-                        generation: generation,
-                        quality: quality,
-                        fileStore: fileStore
-                    ))
-                } catch {
-                    try propagateCancellation(error)
-                    candidateFailures.append("PNG 无损优化：\(error.localizedDescription)")
+                )
+                pngCandidates = pngBranch.candidates
+                selectedPNGCandidateID = pngBranch.selectedCandidateID
+                candidateFailures.append(contentsOf: pngBranch.failures)
+            } else {
+                let pngBox = CandidateBranchResultBox()
+                let jpegBox = CandidateBranchResultBox()
+                let group = DispatchGroup()
+                let queue = DispatchQueue.global(qos: .userInitiated)
+
+                group.enter()
+                queue.async {
+                    defer { group.leave() }
+                    pngBox.store(Result {
+                        try self.makePNGCandidateBranch(
+                            decoded: decoded,
+                            sourceURL: snapshotURL,
+                            itemID: itemID,
+                            generation: generation,
+                            quality: quality,
+                            toolInputURL: toolInputURL,
+                            originalBytes: originalBytes,
+                            preset: preset,
+                            fileStore: fileStore
+                        )
+                    })
                 }
-            }
-            pngCandidate = preferredCandidate(pngCandidates, preset: preset)
-            if !decoded.hasTransparency {
-                do {
-                    jpegCandidate = try makeCandidate(
-                        decoded: decoded,
-                        sourceURL: snapshotURL,
-                        itemID: itemID,
-                        generation: generation,
-                        format: .jpeg,
-                        quality: quality,
-                        variant: "lossy",
-                        fileStore: fileStore
-                    )
-                } catch {
-                    try propagateCancellation(error)
-                    candidateFailures.append("JPEG：\(error.localizedDescription)")
+                group.enter()
+                queue.async {
+                    defer { group.leave() }
+                    jpegBox.store(Result {
+                        try self.makeOpaquePNGJPEGCandidateBranch(
+                            decoded: decoded,
+                            sourceURL: snapshotURL,
+                            itemID: itemID,
+                            generation: generation,
+                            quality: quality,
+                            toolInputURL: toolInputURL,
+                            fileStore: fileStore
+                        )
+                    })
                 }
+                group.wait()
+
+                let pngBranch = try pngBox.load().get()
+                let jpegBranch = try jpegBox.load().get()
+                pngCandidates = pngBranch.candidates
+                selectedPNGCandidateID = pngBranch.selectedCandidateID
+                jpegCandidate = jpegBranch.selectedCandidate
+                candidateFailures.append(contentsOf: pngBranch.failures)
+                candidateFailures.append(contentsOf: jpegBranch.failures)
+                try throwIfCancelled(operation)
             }
-            if pngCandidate == nil, decoded.hasTransparency || jpegCandidate == nil {
+            if selectedPNGCandidateID == nil, decoded.hasTransparency || jpegCandidate == nil {
                 throw CompressionEngineError.validationFailed(
                     candidateFailures.joined(separator: "；")
                 )
             }
         }
 
+        let pngCandidate = selectedPNGCandidateID.flatMap { selectedID in
+            pngCandidates.first { $0.id == selectedID }
+        }
         let decision = CompressionPolicy.choose(
             inputFormat: decoded.format,
             hasTransparency: decoded.hasTransparency,
@@ -523,6 +628,7 @@ final class CompressionEngine: @unchecked Sendable {
         case let .candidate(format, reviewRecommended):
             selectedFormat = format
             review = reviewRecommended
+                || (format == .png && pngCandidate?.isBelowReferenceQuality == true)
         case .noBenefit:
             selectedFormat = nil
             review = false
@@ -531,7 +637,8 @@ final class CompressionEngine: @unchecked Sendable {
             inputFormat: decoded.format,
             hasTransparency: decoded.hasTransparency,
             originalByteCount: originalBytes,
-            pngCandidate: pngCandidate,
+            pngCandidates: pngCandidates,
+            selectedPNGCandidateID: selectedPNGCandidateID,
             jpegCandidate: jpegCandidate,
             selectedFormat: selectedFormat,
             reviewRecommended: review,
@@ -557,6 +664,14 @@ final class CompressionEngine: @unchecked Sendable {
         if format == .jpeg, decoded.hasTransparency {
             throw CompressionEngineError.validationFailed("透明图片不能转为 JPEG")
         }
+        let toolInputURL = try toolInputIfNeeded(
+            decoded: decoded,
+            sourceURL: snapshotURL,
+            itemID: itemID,
+            operation: operation,
+            candidateFormats: [format],
+            fileStore: fileStore
+        )
         return try makeCandidate(
             decoded: decoded,
             sourceURL: snapshotURL,
@@ -564,8 +679,70 @@ final class CompressionEngine: @unchecked Sendable {
             generation: generation,
             format: format,
             quality: quality,
+            toolInputURL: toolInputURL,
             fileStore: fileStore
         )
+    }
+
+    func preparePNGPaletteCandidates(
+        snapshotURL: URL,
+        itemID: UUID,
+        generation: Int,
+        existingCandidates: [CompressionCandidate],
+        fileStore: SessionFileStore
+    ) throws -> [CompressionCandidate] {
+        let operation = OperationKey(itemID: itemID, generation: generation)
+        beginOperation(operation)
+        defer { endOperation(operation) }
+        try throwIfCancelled(operation)
+
+        let decoded = try ImageDecoder.decode(snapshotURL)
+        guard decoded.format == .png else {
+            throw CompressionEngineError.validationFailed("只有 PNG 可以准备调色板候选")
+        }
+        let existingMaximumColors = Set(existingCandidates.compactMap(\.pngPaletteMaximumColors))
+        let preparationOrder = PNGPaletteCandidatePolicy.additionalPreparationOrder
+            + [PNGPaletteCandidatePolicy.initialMaximumColors]
+        let missingMaximumColors = preparationOrder.filter { !existingMaximumColors.contains($0) }
+        guard !missingMaximumColors.isEmpty else { return [] }
+
+        guard let normalizedInput = try toolInputIfNeeded(
+            decoded: decoded,
+            sourceURL: snapshotURL,
+            itemID: itemID,
+            operation: operation,
+            candidateFormats: [.png],
+            fileStore: fileStore
+        ) else {
+            throw CompressionEngineError.validationFailed("缺少规范化工具输入")
+        }
+        var candidates: [CompressionCandidate] = []
+        var failures: [String] = []
+        for maximumColors in missingMaximumColors {
+            try throwIfCancelled(operation)
+            do {
+                candidates.append(try makePNGPaletteCandidate(
+                    decoded: decoded,
+                    normalizedInput: normalizedInput,
+                    itemID: itemID,
+                    generation: generation,
+                    maximumColors: maximumColors,
+                    quality: existingCandidates.first?.quality ?? .default,
+                    operation: operation,
+                    fileStore: fileStore
+                ))
+            } catch {
+                try propagateCancellation(error)
+                failures.append("\(maximumColors) 色探测：\(error.localizedDescription)")
+            }
+        }
+        try throwIfCancelled(operation)
+        guard !candidates.isEmpty else {
+            throw CompressionEngineError.validationFailed(
+                failures.isEmpty ? "没有生成新的 PNG 候选" : failures.joined(separator: "；")
+            )
+        }
+        return candidates
     }
 
     func cancel() {
@@ -585,6 +762,15 @@ final class CompressionEngine: @unchecked Sendable {
         if shouldCancel { toolRunner.cancel() }
     }
 
+    func cancel(itemID: UUID, generation: Int) {
+        let operation = OperationKey(itemID: itemID, generation: generation)
+        activeOperationLock.lock()
+        cancelledOperations.insert(operation)
+        let shouldCancel = activeOperation == operation
+        activeOperationLock.unlock()
+        if shouldCancel { toolRunner.cancel() }
+    }
+
     private func beginOperation(_ operation: OperationKey) {
         activeOperationLock.lock()
         activeOperation = operation
@@ -599,10 +785,14 @@ final class CompressionEngine: @unchecked Sendable {
     }
 
     private func throwIfCancelled(_ operation: OperationKey) throws {
+        if isCancelled(operation) { throw CompressionEngineError.cancelled }
+    }
+
+    private func isCancelled(_ operation: OperationKey) -> Bool {
         activeOperationLock.lock()
         let cancelled = allOperationsCancelled || cancelledOperations.contains(operation)
         activeOperationLock.unlock()
-        if cancelled { throw CompressionEngineError.cancelled }
+        return cancelled
     }
 
     private func propagateCancellation(_ error: Error) throws {
@@ -613,6 +803,96 @@ final class CompressionEngine: @unchecked Sendable {
         }
     }
 
+    private func makePNGCandidateBranch(
+        decoded: DecodedImage,
+        sourceURL: URL,
+        itemID: UUID,
+        generation: Int,
+        quality: CompressionQuality,
+        toolInputURL: URL?,
+        originalBytes: Int64,
+        preset: QualityPreset,
+        fileStore: SessionFileStore
+    ) throws -> CandidateBranchResult {
+        let operation = OperationKey(itemID: itemID, generation: generation)
+        var candidates: [CompressionCandidate] = []
+        var failures: [String] = []
+        do {
+            candidates.append(try makeCandidate(
+                decoded: decoded,
+                sourceURL: sourceURL,
+                itemID: itemID,
+                generation: generation,
+                format: .png,
+                quality: quality,
+                toolInputURL: toolInputURL,
+                variant: "lossy",
+                fileStore: fileStore
+            ))
+        } catch {
+            try propagateCancellation(error)
+            failures.append("PNG：\(error.localizedDescription)")
+        }
+        try throwIfCancelled(operation)
+        if candidates.first.map({
+            !isAcceptable($0, originalBytes: originalBytes, preset: preset)
+        }) ?? true {
+            do {
+                candidates.append(try makeLosslessPNGCandidate(
+                    decoded: decoded,
+                    itemID: itemID,
+                    generation: generation,
+                    quality: quality,
+                    fileStore: fileStore
+                ))
+            } catch {
+                try propagateCancellation(error)
+                failures.append("PNG 无损优化：\(error.localizedDescription)")
+            }
+        }
+        return CandidateBranchResult(
+            candidates: candidates,
+            selectedCandidateID: preferredCandidate(candidates, preset: preset)?.id,
+            failures: failures
+        )
+    }
+
+    private func makeOpaquePNGJPEGCandidateBranch(
+        decoded: DecodedImage,
+        sourceURL: URL,
+        itemID: UUID,
+        generation: Int,
+        quality: CompressionQuality,
+        toolInputURL: URL?,
+        fileStore: SessionFileStore
+    ) throws -> CandidateBranchResult {
+        do {
+            let candidate = try makeCandidate(
+                decoded: decoded,
+                sourceURL: sourceURL,
+                itemID: itemID,
+                generation: generation,
+                format: .jpeg,
+                quality: quality,
+                toolInputURL: toolInputURL,
+                variant: "lossy",
+                fileStore: fileStore
+            )
+            return CandidateBranchResult(
+                candidates: [candidate],
+                selectedCandidateID: candidate.id,
+                failures: []
+            )
+        } catch {
+            try propagateCancellation(error)
+            return CandidateBranchResult(
+                candidates: [],
+                selectedCandidateID: nil,
+                failures: ["JPEG：\(error.localizedDescription)"]
+            )
+        }
+    }
+
     private func makeCandidate(
         decoded: DecodedImage,
         sourceURL: URL,
@@ -620,6 +900,7 @@ final class CompressionEngine: @unchecked Sendable {
         generation: Int,
         format: LitheImageFormat,
         quality: CompressionQuality,
+        toolInputURL: URL?,
         variant: String? = nil,
         fileStore: SessionFileStore
     ) throws -> CompressionCandidate {
@@ -635,24 +916,24 @@ final class CompressionEngine: @unchecked Sendable {
         if (format == .png && toolRunner.bundledTool(named: "pngquant") != nil)
             || (format == .jpeg && toolRunner.bundledTool(named: "cjpegli") != nil) {
             do {
-                let normalizedInput = try normalizedToolInput(
-                    decoded: decoded,
-                    itemID: itemID,
-                    generation: generation,
-                    fileStore: fileStore
-                )
+                guard let toolInputURL else {
+                    throw CompressionEngineError.validationFailed("缺少规范化工具输入")
+                }
                 switch format {
                 case .png:
                     usedBundledTool = try encodePNGWithBundledToolsIfAvailable(
-                        sourceURL: normalizedInput,
+                        sourceURL: toolInputURL,
                         outputURL: outputURL,
-                        quality: quality
+                        maximumColors: PNGPaletteCandidatePolicy.initialMaximumColors,
+                        requireOxiPNG: false,
+                        operation: operation
                     )
                 case .jpeg:
                     usedBundledTool = try encodeJPEGWithBundledToolIfAvailable(
-                        sourceURL: normalizedInput,
+                        sourceURL: toolInputURL,
                         outputURL: outputURL,
-                        quality: quality
+                        quality: quality,
+                        operation: operation
                     )
                 }
             } catch {
@@ -678,7 +959,8 @@ final class CompressionEngine: @unchecked Sendable {
                 decoded: decoded,
                 format: format,
                 quality: quality,
-                outputURL: outputURL
+                outputURL: outputURL,
+                operation: operation
             )
         }
         try throwIfCancelled(operation)
@@ -691,7 +973,10 @@ final class CompressionEngine: @unchecked Sendable {
                 quality: quality,
                 backend: usedBundledTool
                     ? (format == .png ? .pngquant : .cjpegli)
-                    : .imageIO
+                    : .imageIO,
+                pngPaletteMaximumColors: usedBundledTool && format == .png
+                    ? PNGPaletteCandidatePolicy.initialMaximumColors
+                    : nil
             )
         } catch {
             guard usedBundledTool else { throw error }
@@ -699,16 +984,54 @@ final class CompressionEngine: @unchecked Sendable {
                 decoded: decoded,
                 format: format,
                 quality: quality,
-                outputURL: outputURL
+                outputURL: outputURL,
+                operation: operation
             )
             return try validatedCandidate(
                 decoded: decoded,
                 outputURL: outputURL,
                 format: format,
                 quality: quality,
-                backend: .imageIO
+                backend: .imageIO,
+                pngPaletteMaximumColors: nil
             )
         }
+    }
+
+    private func makePNGPaletteCandidate(
+        decoded: DecodedImage,
+        normalizedInput: URL,
+        itemID: UUID,
+        generation: Int,
+        maximumColors: Int,
+        quality: CompressionQuality,
+        operation: OperationKey,
+        fileStore: SessionFileStore
+    ) throws -> CompressionCandidate {
+        let outputURL = try fileStore.candidateURL(
+            itemID: itemID,
+            format: .png,
+            generation: generation,
+            variant: "palette-\(maximumColors)"
+        )
+        let encoded = try encodePNGWithBundledToolsIfAvailable(
+            sourceURL: normalizedInput,
+            outputURL: outputURL,
+            maximumColors: maximumColors,
+            requireOxiPNG: true,
+            operation: operation
+        )
+        guard encoded else {
+            throw CompressionEngineError.validationFailed("pngquant 或 OxiPNG 编码失败")
+        }
+        return try validatedCandidate(
+            decoded: decoded,
+            outputURL: outputURL,
+            format: .png,
+            quality: quality,
+            backend: .pngquant,
+            pngPaletteMaximumColors: maximumColors
+        )
     }
 
     private func validatedCandidate(
@@ -716,7 +1039,8 @@ final class CompressionEngine: @unchecked Sendable {
         outputURL: URL,
         format: LitheImageFormat,
         quality: CompressionQuality,
-        backend: CompressionBackend
+        backend: CompressionBackend,
+        pngPaletteMaximumColors: Int? = nil
     ) throws -> CompressionCandidate {
         let candidateDecoded = try ImageDecoder.decode(outputURL)
         guard candidateDecoded.format == format else {
@@ -754,36 +1078,87 @@ final class CompressionEngine: @unchecked Sendable {
             byteCount: try fileSize(outputURL),
             ssim: score,
             quality: quality,
-            backend: backend
+            backend: backend,
+            pngPaletteMaximumColors: pngPaletteMaximumColors
         )
     }
 
-    private func normalizedToolInput(
+    private func toolInputIfNeeded(
         decoded: DecodedImage,
+        sourceURL: URL,
         itemID: UUID,
-        generation: Int,
+        operation: OperationKey,
+        candidateFormats: [LitheImageFormat],
         fileStore: SessionFileStore
-    ) throws -> URL {
-        let inputURL = try fileStore.candidateURL(
-            itemID: itemID,
-            format: .png,
-            generation: generation,
-            variant: "normalized"
-        )
-        try ImageEncoder.encode(
-            decoded,
-            format: .png,
-            quality: 1,
-            to: inputURL
-        )
-        return inputURL
+    ) throws -> URL? {
+        let needsBundledToolInput = candidateFormats.contains { format in
+            switch format {
+            case .png:
+                toolRunner.bundledTool(named: "pngquant") != nil
+            case .jpeg:
+                toolRunner.bundledTool(named: "cjpegli") != nil
+            }
+        }
+        guard needsBundledToolInput else { return nil }
+        do {
+            try throwIfCancelled(operation)
+            if decoded.format == .png, decoded.sourceOrientation == 1 {
+                return sourceURL
+            }
+
+            let inputURL = try fileStore.normalizedInputURL(itemID: itemID)
+            if isReusableNormalizedInput(inputURL, decoded: decoded) {
+                return inputURL
+            }
+            try? FileManager.default.removeItem(at: inputURL)
+
+            let temporaryURL = try fileStore.temporaryNormalizedInputURL(itemID: itemID)
+            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+            try ImageEncoder.encode(
+                decoded,
+                format: .png,
+                quality: 1,
+                to: temporaryURL
+            )
+            try throwIfCancelled(operation)
+            do {
+                try FileManager.default.moveItem(at: temporaryURL, to: inputURL)
+            } catch {
+                guard isReusableNormalizedInput(inputURL, decoded: decoded) else { throw error }
+            }
+            return inputURL
+        } catch {
+            try propagateCancellation(error)
+            return nil
+        }
+    }
+
+    private func isReusableNormalizedInput(_ url: URL, decoded: DecodedImage) -> Bool {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              CGImageSourceGetCount(source) == 1,
+              CGImageSourceGetType(source) as String? == UTType.png.identifier,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              let properties = CGImageSourceCopyPropertiesAtIndex(
+                source,
+                0,
+                nil
+              ) as? [CFString: Any],
+              (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue
+                == decoded.image.width,
+              (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue
+                == decoded.image.height,
+              ((properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1) == 1 else {
+            return false
+        }
+        return true
     }
 
     private func encodeImageIOFallback(
         decoded: DecodedImage,
         format: LitheImageFormat,
         quality: CompressionQuality,
-        outputURL: URL
+        outputURL: URL,
+        operation: OperationKey
     ) throws {
         try ImageEncoder.encode(
             decoded,
@@ -796,7 +1171,7 @@ final class CompressionEngine: @unchecked Sendable {
         do {
             _ = try toolRunner.run(executableURL: oxipng, arguments: [
                 "-o", "2", "--strip", "safe", outputURL.path,
-            ])
+            ], cancellationCheck: { self.isCancelled(operation) })
         } catch let error as ToolRunnerError {
             if case .cancelled = error { throw error }
             try ImageEncoder.encode(
@@ -828,11 +1203,13 @@ final class CompressionEngine: @unchecked Sendable {
             generation: generation,
             variant: "lossless"
         )
+        let operation = OperationKey(itemID: itemID, generation: generation)
         try encodeImageIOFallback(
             decoded: decoded,
             format: .png,
             quality: quality,
-            outputURL: outputURL
+            outputURL: outputURL,
+            operation: operation
         )
         return try validatedCandidate(
             decoded: decoded,
@@ -864,7 +1241,12 @@ final class CompressionEngine: @unchecked Sendable {
         if !transformArguments.isEmpty { arguments.append("-perfect") }
         arguments.append(contentsOf: transformArguments)
         arguments.append(contentsOf: ["-outfile", outputURL.path, sourceURL.path])
-        _ = try toolRunner.run(executableURL: jpegtran, arguments: arguments)
+        let operation = OperationKey(itemID: itemID, generation: generation)
+        _ = try toolRunner.run(
+            executableURL: jpegtran,
+            arguments: arguments,
+            cancellationCheck: { self.isCancelled(operation) }
+        )
         try JPEGMetadataSanitizer.sanitize(
             outputURL,
             dpiWidth: decoded.dpiWidth,
@@ -918,22 +1300,28 @@ final class CompressionEngine: @unchecked Sendable {
     private func encodePNGWithBundledToolsIfAvailable(
         sourceURL: URL,
         outputURL: URL,
-        quality: CompressionQuality
+        maximumColors: Int,
+        requireOxiPNG: Bool,
+        operation: OperationKey
     ) throws -> Bool {
         guard let pngquant = toolRunner.bundledTool(named: "pngquant") else { return false }
-        let range = quality.level.parameters.pngQualityRange
         do {
             _ = try toolRunner.run(executableURL: pngquant, arguments: [
                 "--force",
-                "--quality", "\(range.lowerBound)-\(range.upperBound)",
+                "--quality", "0-100",
+                "\(maximumColors)",
                 "--output", outputURL.path,
                 sourceURL.path,
-            ])
+            ], cancellationCheck: { self.isCancelled(operation) })
             if let oxipng = toolRunner.bundledTool(named: "oxipng") {
                 _ = try toolRunner.run(executableURL: oxipng, arguments: [
                     "-o", "2", "--strip", "safe", outputURL.path,
-                ])
+                ], cancellationCheck: { self.isCancelled(operation) })
+            } else if requireOxiPNG {
+                try? FileManager.default.removeItem(at: outputURL)
+                return false
             }
+            try PNGRenderingMetadataRestorer.restore(from: sourceURL, to: outputURL)
             return true
         } catch let error as ToolRunnerError {
             if case .cancelled = error { throw error }
@@ -948,7 +1336,8 @@ final class CompressionEngine: @unchecked Sendable {
     private func encodeJPEGWithBundledToolIfAvailable(
         sourceURL: URL,
         outputURL: URL,
-        quality: CompressionQuality
+        quality: CompressionQuality,
+        operation: OperationKey
     ) throws -> Bool {
         guard let cjpegli = toolRunner.bundledTool(named: "cjpegli") else { return false }
         do {
@@ -956,7 +1345,7 @@ final class CompressionEngine: @unchecked Sendable {
             let qualityValue = quality.level.parameters.jpegQualityPercent
             _ = try toolRunner.run(executableURL: cjpegli, arguments: [
                 sourceURL.path, outputURL.path, "--quality=\(qualityValue)",
-            ])
+            ], cancellationCheck: { self.isCancelled(operation) })
             return true
         } catch let error as ToolRunnerError {
             if case .cancelled = error { throw error }

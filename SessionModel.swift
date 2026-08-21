@@ -144,7 +144,10 @@ final class SessionItem: Identifiable {
     var inputFormat: LitheImageFormat?
     var hasTransparency = false
     var originalByteCount: Int64 = 0
-    var pngCandidate: CompressionCandidate?
+    var pngCandidates: [CompressionCandidate] = []
+    var selectedPNGCandidateID: UUID?
+    var pngPreparationState: PNGCandidatePreparationState = .idle
+    var pngPreparationGeneration = 0
     var jpegCandidate: CompressionCandidate?
     var selectedFormat: LitheImageFormat?
     var publishedURL: URL?
@@ -177,6 +180,11 @@ final class SessionItem: Identifiable {
         }
     }
 
+    var pngCandidate: CompressionCandidate? {
+        guard let selectedPNGCandidateID else { return pngCandidates.last }
+        return pngCandidates.first { $0.id == selectedPNGCandidateID } ?? pngCandidates.last
+    }
+
     var effectiveResultURL: URL? {
         switch status {
         case .ready:
@@ -207,7 +215,7 @@ final class SessionItem: Identifiable {
     }
 
     var canInspect: Bool {
-        snapshotURL != nil && (pngCandidate != nil || jpegCandidate != nil)
+        snapshotURL != nil && (!pngCandidates.isEmpty || jpegCandidate != nil)
     }
 
     var canRemoveRecord: Bool {
@@ -220,6 +228,11 @@ final class SessionItem: Identifiable {
     func beginGeneration() -> Int {
         generation += 1
         return generation
+    }
+
+    func beginPNGPreparation() -> Int {
+        pngPreparationGeneration += 1
+        return pngPreparationGeneration
     }
 
     @discardableResult

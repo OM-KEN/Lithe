@@ -24,9 +24,26 @@ enum ToolRunnerError: LocalizedError {
 }
 
 final class ToolRunner: @unchecked Sendable {
+    private final class TrackedProcess: @unchecked Sendable {
+        let process: Process
+        let wake: DispatchSemaphore
+        let terminated: DispatchSemaphore
+
+        init(
+            process: Process,
+            wake: DispatchSemaphore,
+            terminated: DispatchSemaphore
+        ) {
+            self.process = process
+            self.wake = wake
+            self.terminated = terminated
+        }
+    }
+
     private let lock = NSLock()
-    private var activeProcess: Process?
+    private var activeProcesses: [ObjectIdentifier: TrackedProcess] = [:]
     private var cancelledProcesses: Set<ObjectIdentifier> = []
+    private var cancellationGeneration: UInt64 = 0
     private let toolsDirectory: URL?
 
     init(toolsDirectory: URL? = Bundle.main.resourceURL?.appendingPathComponent(
@@ -45,12 +62,23 @@ final class ToolRunner: @unchecked Sendable {
     func run(
         executableURL: URL,
         arguments: [String],
-        timeout: TimeInterval = 120
+        timeout: TimeInterval = 120,
+        cancellationCheck: @escaping @Sendable () -> Bool = { false }
     ) throws -> ToolResult {
         guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
             throw ToolRunnerError.unavailable(executableURL.lastPathComponent)
         }
+        if cancellationCheck() {
+            throw ToolRunnerError.cancelled(executableURL.lastPathComponent)
+        }
+        lock.lock()
+        let startingCancellationGeneration = cancellationGeneration
+        lock.unlock()
+
         let process = Process()
+        let wake = DispatchSemaphore(value: 0)
+        let terminated = DispatchSemaphore(value: 0)
+        let tracked = TrackedProcess(process: process, wake: wake, terminated: terminated)
         let temporaryDirectory = FileManager.default.temporaryDirectory
         let stdoutURL = temporaryDirectory.appendingPathComponent("lithe-stdout-\(UUID().uuidString)")
         let stderrURL = temporaryDirectory.appendingPathComponent("lithe-stderr-\(UUID().uuidString)")
@@ -68,38 +96,67 @@ final class ToolRunner: @unchecked Sendable {
         process.arguments = arguments
         process.standardOutput = output
         process.standardError = error
+        process.terminationHandler = { _ in
+            terminated.signal()
+            wake.signal()
+        }
 
+        let identifier = ObjectIdentifier(process)
+        let cancelledBeforeRegistration = cancellationCheck()
         lock.lock()
-        activeProcess = process
+        activeProcesses[identifier] = tracked
+        if cancelledBeforeRegistration
+            || cancellationGeneration != startingCancellationGeneration {
+            cancelledProcesses.insert(identifier)
+        }
         lock.unlock()
         defer {
+            process.terminationHandler = nil
             lock.lock()
-            if activeProcess === process { activeProcess = nil }
-            cancelledProcesses.remove(ObjectIdentifier(process))
+            activeProcesses.removeValue(forKey: identifier)
+            cancelledProcesses.remove(identifier)
             lock.unlock()
         }
 
-        try process.run()
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning, Date() < deadline {
-            if isCancelled(process) {
-                stopAndReap(process)
-                throw ToolRunnerError.cancelled(executableURL.lastPathComponent)
-            }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
-        }
-        if isCancelled(process) {
-            if process.isRunning { stopAndReap(process) }
+        if isCancelled(process) || cancellationCheck() {
             throw ToolRunnerError.cancelled(executableURL.lastPathComponent)
         }
-        if process.isRunning {
-            stopAndReap(process)
+        do {
+            try process.run()
+        } catch {
+            if isCancelled(process) {
+                throw ToolRunnerError.cancelled(executableURL.lastPathComponent)
+            }
+            throw error
+        }
+        if isCancelled(process) {
+            stopAndReap(tracked)
+            throw ToolRunnerError.cancelled(executableURL.lastPathComponent)
+        }
+
+        let waitResult = wake.wait(timeout: .now() + timeout)
+        if isCancelled(process) {
+            stopAndReap(tracked)
+            throw ToolRunnerError.cancelled(executableURL.lastPathComponent)
+        }
+        if waitResult == .timedOut {
+            stopAndReap(tracked)
+            if isCancelled(process) {
+                throw ToolRunnerError.cancelled(executableURL.lastPathComponent)
+            }
             throw ToolRunnerError.timedOut(executableURL.lastPathComponent)
+        }
+        process.waitUntilExit()
+        if isCancelled(process) {
+            throw ToolRunnerError.cancelled(executableURL.lastPathComponent)
         }
         try output.synchronize()
         try error.synchronize()
         let stdoutData = try Data(contentsOf: stdoutURL)
         let stderrData = try Data(contentsOf: stderrURL)
+        if isCancelled(process) {
+            throw ToolRunnerError.cancelled(executableURL.lastPathComponent)
+        }
         guard process.terminationStatus == 0 else {
             throw ToolRunnerError.failed(
                 executableURL.lastPathComponent,
@@ -116,10 +173,16 @@ final class ToolRunner: @unchecked Sendable {
 
     func cancel() {
         lock.lock()
-        let process = activeProcess
-        if let process { cancelledProcesses.insert(ObjectIdentifier(process)) }
+        cancellationGeneration &+= 1
+        let trackedProcesses = Array(activeProcesses.values)
+        for tracked in trackedProcesses {
+            cancelledProcesses.insert(ObjectIdentifier(tracked.process))
+        }
         lock.unlock()
-        if process?.isRunning == true { process?.terminate() }
+        for tracked in trackedProcesses {
+            tracked.wake.signal()
+            if tracked.process.isRunning { tracked.process.terminate() }
+        }
     }
 
     private func isCancelled(_ process: Process) -> Bool {
@@ -128,14 +191,14 @@ final class ToolRunner: @unchecked Sendable {
         return cancelledProcesses.contains(ObjectIdentifier(process))
     }
 
-    private func stopAndReap(_ process: Process) {
-        process.terminate()
-        let gracefulDeadline = Date().addingTimeInterval(1)
-        while process.isRunning, Date() < gracefulDeadline {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
-        }
+    private func stopAndReap(_ tracked: TrackedProcess) {
+        let process = tracked.process
         if process.isRunning {
-            Darwin.kill(process.processIdentifier, SIGKILL)
+            process.terminate()
+            if tracked.terminated.wait(timeout: .now() + 1) == .timedOut,
+               process.isRunning {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+            }
         }
         process.waitUntilExit()
     }

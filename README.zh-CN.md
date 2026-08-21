@@ -4,14 +4,15 @@
 
 Lithe 是一款轻量的 macOS 图片压缩工具。它会自动压缩 JPG 和 PNG，需要时也可以打开检查窗口仔细比较结果。
 
-[下载 Lithe 1.0.0](https://github.com/OM-KEN/Lithe/releases/download/v1.0.0/Lithe-1.0.0.dmg) · 需要 macOS 14 或更高版本
+[下载 Lithe 1.1.0](https://github.com/OM-KEN/Lithe/releases/download/v1.1.0/Lithe-1.1.0.dmg) · 需要 macOS 14 或更高版本
 
 ## 功能
 
 - 压缩静态 JPG 和 PNG 图片。
 - 为不透明 PNG 比较 PNG 与 JPEG 结果。
 - 在检查窗口中同步缩放和平移图片。
-- 使用三档快捷质量或 10 级高级调节。
+- JPEG 可使用三档快捷质量或 10 级高级调节。
+- PNG 会按图片内容准备最多四个有明显体积差异的真实结果，避免重复档位。
 - 拖出结果、在 Finder 中显示、创建 ZIP，或将原图移到废纸篓并在当前会话撤销。
 - 通过不可变快照保护原图，始终以非破坏方式生成结果。
 

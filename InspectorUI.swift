@@ -36,6 +36,8 @@ struct InspectorActions {
     let next: () -> Void
     let selectCandidate: (LitheImageFormat) -> Void
     let recompress: (CompressionQuality) -> Void
+    let preparePNGPaletteCandidates: () -> Void
+    let selectPNGCandidate: (UUID) -> Void
 }
 
 @MainActor
@@ -121,6 +123,9 @@ struct InspectorView: View {
     @State private var isAdvancedExpanded = false
     @State private var isEditingAdvanced = false
     @State private var advancedDebounceTask: Task<Void, Never>?
+    @State private var pngCandidatePosition = 0.0
+    @State private var isEditingPNGCandidate = false
+    @State private var pngCandidateDebounceTask: Task<Void, Never>?
     @State private var background: InspectorBackground = .transparent
     @State private var pendingFormat: LitheImageFormat?
     @StateObject private var viewportGroup = SynchronizedViewportGroup()
@@ -140,11 +145,16 @@ struct InspectorView: View {
                 }
                 .onChange(of: item.id) { _, _ in
                     synchronizeQuality(from: item)
+                    synchronizePNGCandidate(from: item)
                     pendingFormat = nil
                     viewportGroup.resetToActualSize()
                 }
                 .onChange(of: item.selectedCandidate?.id) { _, _ in
                     synchronizeQuality(from: item)
+                    synchronizePNGCandidate(from: item)
+                }
+                .onChange(of: item.pngPreparationState) { _, state in
+                    if state == .ready { synchronizePNGCandidate(from: item) }
                 }
                 .onChange(of: item.isRecompressing) { _, isRecompressing in
                     if !isRecompressing { pendingFormat = nil }
@@ -155,11 +165,15 @@ struct InspectorView: View {
                 }
                 .onAppear {
                     synchronizeQuality(from: item)
+                    synchronizePNGCandidate(from: item)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         viewportGroup.resetToActualSize()
                     }
                 }
-                .onDisappear { advancedDebounceTask?.cancel() }
+                .onDisappear {
+                    advancedDebounceTask?.cancel()
+                    pngCandidateDebounceTask?.cancel()
+                }
             } else {
                 ContentUnavailableView("没有可检查的图片", systemImage: "photo.badge.exclamationmark")
             }
@@ -210,7 +224,7 @@ struct InspectorView: View {
                     background: background
                 )
             }
-            if let png = item.pngCandidate {
+            if let png = displayedPNGCandidate(item) {
                 comparisonColumn(
                     role: .png,
                     title: "PNG",
@@ -314,29 +328,11 @@ struct InspectorView: View {
     private func controls(_ item: SessionItem) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
-                Picker("质量", selection: quickPresetBinding(item)) {
-                    ForEach(QualityPreset.allCases, id: \.self) { value in
-                        Text(value.displayName).tag(Optional(value))
-                    }
+                if activeFormat(item) == .png {
+                    pngControls(item)
+                } else {
+                    jpegControls(item)
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 260)
-
-                Button {
-                    advancedDebounceTask?.cancel()
-                    isAdvancedExpanded.toggle()
-                    if isAdvancedExpanded {
-                        advancedLevel = Double(quality.level.rawValue)
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(quality.preset == nil ? quality.displayName : "高级")
-                        Image(systemName: isAdvancedExpanded ? "chevron.down" : "chevron.right")
-                    }
-                }
-                .buttonStyle(.bordered)
-                .tint(quality.preset == nil ? .accentColor : .secondary)
-                .help(quality.preset == nil ? quality.displayName : "展开高级质量")
 
                 Picker("背景", selection: $background) {
                     ForEach(InspectorBackground.allCases, id: \.self) { value in
@@ -374,12 +370,109 @@ struct InspectorView: View {
                 .accessibilityLabel("关闭检查")
             }
             .padding(.horizontal, 16)
-            .frame(height: 54)
+            .frame(height: activeFormat(item) == .png ? 64 : 54)
 
-            if isAdvancedExpanded {
+            if activeFormat(item) == .jpeg, isAdvancedExpanded {
                 Divider()
                 advancedControls(item)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func jpegControls(_ item: SessionItem) -> some View {
+        Picker("质量", selection: quickPresetBinding(item)) {
+            ForEach(QualityPreset.allCases, id: \.self) { value in
+                Text(value.displayName).tag(Optional(value))
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 260)
+
+        Button {
+            advancedDebounceTask?.cancel()
+            isAdvancedExpanded.toggle()
+            if isAdvancedExpanded {
+                advancedLevel = Double(quality.level.rawValue)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(quality.preset == nil ? quality.displayName : "高级")
+                Image(systemName: isAdvancedExpanded ? "chevron.down" : "chevron.right")
+            }
+        }
+        .buttonStyle(.bordered)
+        .tint(quality.preset == nil ? .accentColor : .secondary)
+        .help(quality.preset == nil ? quality.displayName : "展开高级质量")
+    }
+
+    @ViewBuilder
+    private func pngControls(_ item: SessionItem) -> some View {
+        switch item.pngPreparationState {
+        case .idle:
+            if let candidate = displayedPNGCandidate(item) {
+                Text(pngCandidateSummary(candidate))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            Button("进一步减小…", action: actions.preparePNGPaletteCandidates)
+                .buttonStyle(.borderedProminent)
+        case .preparing:
+            ProgressView()
+                .controlSize(.small)
+            Text("正在准备更小的 PNG 结果…")
+                .font(.system(size: 12, weight: .medium))
+        case .ready:
+            if item.pngCandidates.count > 1 {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text("更小")
+                        Slider(
+                            value: $pngCandidatePosition,
+                            in: 0 ... Double(max(0, item.pngCandidates.count - 1)),
+                            step: 1,
+                            onEditingChanged: { editing in
+                                isEditingPNGCandidate = editing
+                                pngCandidateDebounceTask?.cancel()
+                                if !editing { submitPNGCandidate(item: item) }
+                            }
+                        )
+                        .frame(width: 260)
+                        .onChange(of: pngCandidatePosition) { _, _ in
+                            guard !isEditingPNGCandidate else { return }
+                            schedulePNGCandidateSubmission(itemID: item.id)
+                        }
+                        Text("更清晰")
+                    }
+                    if let candidate = displayedPNGCandidate(item) {
+                        Text(pngCandidateSummary(candidate))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 3) {
+                    if let candidate = displayedPNGCandidate(item) {
+                        Text(pngCandidateSummary(candidate))
+                            .font(.system(size: 12))
+                    }
+                    Text("此图片没有更小且有效的调色板结果。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        case let .failed(message):
+            if let candidate = displayedPNGCandidate(item) {
+                Text(pngCandidateSummary(candidate))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            Label("准备失败：\(message)", systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.red)
+                .lineLimit(1)
+                .help(message)
+            Button("重试", action: actions.preparePNGPaletteCandidates)
         }
     }
 
@@ -398,6 +491,7 @@ struct InspectorView: View {
                     if !editing { submitAdvanced(level: currentAdvancedLevel, item: item) }
                 }
             )
+            .help("调整压缩质量")
             .frame(width: 300)
             .onChange(of: advancedLevel) { _, _ in
                 guard AdvancedQualityInteractionPolicy.shouldScheduleSettledChange(
@@ -428,7 +522,18 @@ struct InspectorView: View {
     }
 
     private func activeFormat(_ item: SessionItem) -> LitheImageFormat? {
-        item.selectedFormat ?? item.pngCandidate?.format ?? item.jpegCandidate?.format
+        item.selectedFormat ?? item.pngCandidate?.format ?? item.jpegCandidate?.format ?? item.inputFormat
+    }
+
+    private func displayedPNGCandidate(_ item: SessionItem) -> CompressionCandidate? {
+        guard activeFormat(item) == .png,
+              item.pngPreparationState == .ready,
+              !item.pngCandidates.isEmpty else { return item.pngCandidate }
+        let index = min(
+            max(0, Int(pngCandidatePosition.rounded())),
+            item.pngCandidates.count - 1
+        )
+        return item.pngCandidates[index]
     }
 
     private var currentAdvancedLevel: QualityLevel {
@@ -451,6 +556,18 @@ struct InspectorView: View {
         let selectedQuality = item.selectedCandidate?.quality ?? .default
         quality = selectedQuality
         advancedLevel = Double(selectedQuality.level.rawValue)
+    }
+
+    private func synchronizePNGCandidate(from item: SessionItem) {
+        pngCandidateDebounceTask?.cancel()
+        guard !item.pngCandidates.isEmpty else {
+            pngCandidatePosition = 0
+            return
+        }
+        let selectedIndex = item.selectedPNGCandidateID.flatMap { selectedID in
+            item.pngCandidates.firstIndex { $0.id == selectedID }
+        } ?? (item.pngCandidates.count - 1)
+        pngCandidatePosition = Double(selectedIndex)
     }
 
     private func submitAdvanced(level: QualityLevel, item: SessionItem) {
@@ -490,10 +607,40 @@ struct InspectorView: View {
         }
     }
 
+    private func submitPNGCandidate(item: SessionItem) {
+        pngCandidateDebounceTask?.cancel()
+        guard !item.pngCandidates.isEmpty else { return }
+        let index = min(
+            max(0, Int(pngCandidatePosition.rounded())),
+            item.pngCandidates.count - 1
+        )
+        let candidate = item.pngCandidates[index]
+        guard item.selectedFormat != .png || item.selectedPNGCandidateID != candidate.id else { return }
+        pendingFormat = .png
+        actions.selectPNGCandidate(candidate.id)
+    }
+
+    private func schedulePNGCandidateSubmission(itemID: UUID) {
+        pngCandidateDebounceTask?.cancel()
+        pngCandidateDebounceTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: AdvancedQualityInteractionPolicy.debounceNanoseconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  let item = currentItem,
+                  item.id == itemID else { return }
+            submitPNGCandidate(item: item)
+        }
+    }
+
     private func qualityWarning(_ candidate: CompressionCandidate) -> String? {
-        let reference = candidate.quality.level.parameters.referenceSSIM
-        guard candidate.ssim < reference else { return nil }
-        return "感知质量低于当前级别参考线（\(Int((reference * 100).rounded())))，仍可使用"
+        guard candidate.isBelowReferenceQuality else { return nil }
+        if candidate.format == .png {
+            return "此 PNG 结果低于质量参考，建议以 100% 大小检查文字、边缘和渐变。"
+        }
+        return "此结果低于当前档位的质量参考，建议以 100% 大小检查文字、边缘和渐变。"
     }
 
     private func parameterSummary(
@@ -501,24 +648,33 @@ struct InspectorView: View {
         format: LitheImageFormat?
     ) -> String {
         let parameters = level.parameters
-        let encoding: String
+        let reference = Int((parameters.referenceSSIM * 100).rounded())
         switch format {
         case .jpeg:
-            encoding = "JPEG · Jpegli Q\(parameters.jpegQualityPercent)"
+            return "JPEG · Jpegli Q\(parameters.jpegQualityPercent) · SSIM 参考 \(reference)"
         case .png:
-            encoding = "PNG · pngquant \(parameters.pngQualityRange.lowerBound)–\(parameters.pngQualityRange.upperBound) + OxiPNG O2"
+            return "PNG · 调色板压缩 · 质量参考 \(reference)/100"
         case nil:
-            encoding = ""
+            return "SSIM 参考 \(reference)"
         }
-        let reference = Int((parameters.referenceSSIM * 100).rounded())
-        return encoding.isEmpty ? "SSIM 参考 \(reference)" : "\(encoding) · SSIM 参考 \(reference)"
     }
 
     private func candidateDetail(_ candidate: CompressionCandidate, original: Int64) -> String {
         let reduction = original > 0
             ? Int((Double(original - candidate.byteCount) / Double(original) * 100).rounded())
             : 0
+        if candidate.format == .png {
+            return "\(byteString(candidate.byteCount)) · −\(max(0, reduction))% · 相似度 \(similarityString(candidate))"
+        }
         return "\(byteString(candidate.byteCount)) · −\(max(0, reduction))% · \(candidate.quality.displayName)"
+    }
+
+    private func pngCandidateSummary(_ candidate: CompressionCandidate) -> String {
+        "\(byteString(candidate.byteCount)) · 视觉相似度 \(similarityString(candidate))"
+    }
+
+    private func similarityString(_ candidate: CompressionCandidate) -> String {
+        String(format: "%.1f", candidate.ssim * 100)
     }
 
     private func byteString(_ value: Int64) -> String {

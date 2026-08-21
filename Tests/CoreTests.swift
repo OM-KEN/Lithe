@@ -43,6 +43,7 @@ struct CoreTests {
     static func main() throws {
         compressionSelectionIsConservative()
         advancedQualityMappingAndPoliciesAreExact()
+        pngPaletteCandidatePolicyKeepsOnlyEffectiveResults()
         outputNamingNeverOverwrites()
         selectionAndGenerationAreDeterministic()
         try resultDragPlanAndMarqueeSelectionAreDeterministic()
@@ -63,9 +64,14 @@ struct CoreTests {
         try imagePipelineRejectsCorruptionAndPreservesJPEGRenderingMetadata()
         try jpegInputUsesLosslessJPEGTranBackend()
         try failingOptionalPNGToolFallsBack()
+        try opaquePNGCandidateBranchesRunConcurrentlyAndReuseSnapshot()
+        try normalizedToolInputIsStableAcrossRecompression()
+        try dynamicPNGPalettePreparationHandlesFailuresAndCancellation()
         try compressionCancellationStopsFallbackPipeline()
         try toolRunnerDrainsLargeOutput()
+        try toolRunnerPreflightCancellationDoesNotLaunch()
         try toolRunnerCancellationReapsChild()
+        try toolRunnerCancellationReapsConcurrentChildren()
         toolRunnerTimesOutAndReaps()
         try zipServiceCreatesArchive()
         print("CoreTests: PASS")
@@ -137,16 +143,16 @@ struct CoreTests {
     @MainActor
     private static func advancedQualityMappingAndPoliciesAreExact() {
         let expected = [
-            QualityEncodingParameters(jpegQualityPercent: 68, pngQualityRange: 55 ... 70, referenceSSIM: 0.78),
-            QualityEncodingParameters(jpegQualityPercent: 76, pngQualityRange: 65 ... 78, referenceSSIM: 0.80),
-            QualityEncodingParameters(jpegQualityPercent: 80, pngQualityRange: 72 ... 84, referenceSSIM: 0.83),
-            QualityEncodingParameters(jpegQualityPercent: 84, pngQualityRange: 80 ... 90, referenceSSIM: 0.85),
-            QualityEncodingParameters(jpegQualityPercent: 87, pngQualityRange: 80 ... 92, referenceSSIM: 0.88),
-            QualityEncodingParameters(jpegQualityPercent: 90, pngQualityRange: 80 ... 95, referenceSSIM: 0.90),
-            QualityEncodingParameters(jpegQualityPercent: 92, pngQualityRange: 85 ... 97, referenceSSIM: 0.93),
-            QualityEncodingParameters(jpegQualityPercent: 94, pngQualityRange: 90 ... 100, referenceSSIM: 0.95),
-            QualityEncodingParameters(jpegQualityPercent: 95, pngQualityRange: 93 ... 100, referenceSSIM: 0.97),
-            QualityEncodingParameters(jpegQualityPercent: 96, pngQualityRange: 96 ... 100, referenceSSIM: 0.98),
+            QualityEncodingParameters(jpegQualityPercent: 68, referenceSSIM: 0.78),
+            QualityEncodingParameters(jpegQualityPercent: 76, referenceSSIM: 0.80),
+            QualityEncodingParameters(jpegQualityPercent: 80, referenceSSIM: 0.83),
+            QualityEncodingParameters(jpegQualityPercent: 84, referenceSSIM: 0.85),
+            QualityEncodingParameters(jpegQualityPercent: 87, referenceSSIM: 0.88),
+            QualityEncodingParameters(jpegQualityPercent: 90, referenceSSIM: 0.90),
+            QualityEncodingParameters(jpegQualityPercent: 92, referenceSSIM: 0.93),
+            QualityEncodingParameters(jpegQualityPercent: 94, referenceSSIM: 0.95),
+            QualityEncodingParameters(jpegQualityPercent: 95, referenceSSIM: 0.97),
+            QualityEncodingParameters(jpegQualityPercent: 96, referenceSSIM: 0.98),
         ]
         expect(
             QualityLevel.allCases.map(\.parameters) == expected,
@@ -168,18 +174,49 @@ struct CoreTests {
             "a custom level keeps its advanced identity when the control collapses"
         )
 
+        let candidateURL = URL(fileURLWithPath: "/tmp/quality-candidate.png")
+        let belowReference = CompressionCandidate(
+            format: .png,
+            url: candidateURL,
+            byteCount: 1,
+            ssim: 0.979,
+            quality: .advanced(.two)
+        )
+        let equalToReference = CompressionCandidate(
+            format: .png,
+            url: candidateURL,
+            byteCount: 1,
+            ssim: 0.98,
+            quality: .advanced(.two)
+        )
+        let sameScoreLowerReference = CompressionCandidate(
+            format: .jpeg,
+            url: candidateURL,
+            byteCount: 1,
+            ssim: 0.79,
+            quality: .advanced(.one)
+        )
+        expect(belowReference.isBelowReferenceQuality, "PNG quality below 0.98 is flagged")
+        expect(!equalToReference.isBelowReferenceQuality, "PNG quality equal to 0.98 is accepted")
+        expect(
+            !sameScoreLowerReference.isBelowReferenceQuality,
+            "each candidate uses the reference for its own quality level"
+        )
+
         let item = SessionItem(
             requestID: UUID(),
             sourceURL: URL(fileURLWithPath: "/tmp/quality.png"),
             automaticTrashEnabled: false
         )
-        item.pngCandidate = CompressionCandidate(
+        let pngCandidate = CompressionCandidate(
             format: .png,
             url: URL(fileURLWithPath: "/tmp/quality-png.png"),
             byteCount: 80_000,
             ssim: 0.79,
             quality: .advanced(.two)
         )
+        item.pngCandidates = [pngCandidate]
+        item.selectedPNGCandidateID = pngCandidate.id
         item.jpegCandidate = CompressionCandidate(
             format: .jpeg,
             url: URL(fileURLWithPath: "/tmp/quality-jpeg.jpg"),
@@ -251,6 +288,88 @@ struct CoreTests {
                 jpeg: CandidateFacts(format: .jpeg, byteCount: 99_999, ssim: 1)
             ) == .noBenefit,
             "automatic selection does not inherit the relaxed explicit-recompression rule"
+        )
+    }
+
+    private static func pngPaletteCandidatePolicyKeepsOnlyEffectiveResults() {
+        expect(
+            PNGPaletteCandidatePolicy.maximumColors == [64, 128, 192, 256]
+                && PNGPaletteCandidatePolicy.additionalPreparationOrder == [192, 128, 64]
+                && PNGPaletteCandidatePolicy.initialMaximumColors == 256,
+            "PNG palette budgets and preparation order stay fixed"
+        )
+
+        func candidate(
+            maximumColors: Int?,
+            bytes: Int64,
+            id: UUID = UUID()
+        ) -> CompressionCandidate {
+            CompressionCandidate(
+                id: id,
+                format: .png,
+                url: URL(fileURLWithPath: "/tmp/palette-\(maximumColors ?? 0)-\(id).png"),
+                byteCount: bytes,
+                ssim: maximumColors == nil ? 1 : 0.99,
+                preset: .balanced,
+                backend: maximumColors == nil ? .imageIO : .pngquant,
+                pngPaletteMaximumColors: maximumColors
+            )
+        }
+
+        let c64 = candidate(maximumColors: 64, bytes: 210_000)
+        let c128 = candidate(maximumColors: 128, bytes: 280_000)
+        let c192 = candidate(maximumColors: 192, bytes: 300_000)
+        let c256 = candidate(maximumColors: 256, bytes: 310_000)
+        let effective = PNGPaletteCandidatePolicy.effectiveCandidates(
+            [c256, c64, c192, c128],
+            originalByteCount: 1_000_000,
+            preserving: c256.id
+        )
+        expect(
+            effective.compactMap(\.pngPaletteMaximumColors) == [64, 128, 256],
+            "only meaningfully smaller palette results remain in smaller-to-clearer order"
+        )
+
+        let equalCandidates = [64, 128, 192, 256].map {
+            candidate(maximumColors: $0, bytes: 200_000)
+        }
+        let equalResult = PNGPaletteCandidatePolicy.effectiveCandidates(
+            equalCandidates,
+            originalByteCount: 1_000_000,
+            preserving: equalCandidates.last?.id
+        )
+        expect(
+            equalResult.map(\.pngPaletteMaximumColors) == [256],
+            "equivalent palette results collapse to one visible position"
+        )
+
+        let nonDecreasing = [
+            candidate(maximumColors: 64, bytes: 300_000),
+            candidate(maximumColors: 128, bytes: 290_000),
+            candidate(maximumColors: 192, bytes: 305_000),
+            candidate(maximumColors: 256, bytes: 310_000),
+        ]
+        let monotonicResult = PNGPaletteCandidatePolicy.effectiveCandidates(
+            nonDecreasing,
+            originalByteCount: 1_000_000,
+            preserving: nonDecreasing.last?.id
+        )
+        expect(
+            monotonicResult.compactMap(\.pngPaletteMaximumColors) == [128, 256],
+            "a smaller palette that does not make a smaller file is removed"
+        )
+
+        let preservedLossless = candidate(maximumColors: nil, bytes: 360_000)
+        let unrelatedLossless = candidate(maximumColors: nil, bytes: 340_000)
+        let withLossless = PNGPaletteCandidatePolicy.effectiveCandidates(
+            [c64, c128, c192, c256, unrelatedLossless, preservedLossless],
+            originalByteCount: 1_000_000,
+            preserving: preservedLossless.id
+        )
+        expect(
+            withLossless.last?.id == preservedLossless.id
+                && !withLossless.contains(where: { $0.id == unrelatedLossless.id }),
+            "only an already-selected lossless fallback is kept at the clear end"
         )
     }
 
@@ -489,7 +608,7 @@ struct CoreTests {
             automaticTrashEnabled: false
         )
         item.originalByteCount = 69_748
-        item.pngCandidate = CompressionCandidate(
+        let pngCandidate = CompressionCandidate(
             format: .png,
             url: URL(fileURLWithPath: "/tmp/PixPin-Lithed.png"),
             byteCount: 16_388,
@@ -497,6 +616,8 @@ struct CoreTests {
             preset: .balanced,
             backend: .pngquant
         )
+        item.pngCandidates = [pngCandidate]
+        item.selectedPNGCandidateID = pngCandidate.id
         item.selectedFormat = .png
         item.status = .ready
         expect(item.resultByteCount == 16_388, "ready item exposes selected candidate bytes")
@@ -634,7 +755,7 @@ struct CoreTests {
         )
         pngItem.snapshotURL = pngSource
         pngItem.originalByteCount = 100_000
-        pngItem.pngCandidate = CompressionCandidate(
+        let pngCandidate = CompressionCandidate(
             format: .png,
             url: pngCandidateURL,
             byteCount: 70_000,
@@ -642,6 +763,8 @@ struct CoreTests {
             preset: .balanced,
             backend: .pngquant
         )
+        pngItem.pngCandidates = [pngCandidate]
+        pngItem.selectedPNGCandidateID = pngCandidate.id
         pngItem.jpegCandidate = CompressionCandidate(
             format: .jpeg,
             url: jpegCandidateURL,
@@ -662,7 +785,9 @@ struct CoreTests {
             previous: { },
             next: { },
             selectCandidate: { _ in },
-            recompress: { _ in }
+            recompress: { _ in },
+            preparePNGPaletteCandidates: { },
+            selectPNGCandidate: { _ in }
         )
         let hostingView = NSHostingView(rootView: InspectorView(model: model, actions: actions))
         hostingView.frame = NSRect(x: 0, y: 0, width: 1_200, height: 690)
@@ -717,13 +842,15 @@ struct CoreTests {
         )
         item.status = .ready
         item.snapshotURL = snapshot
-        item.pngCandidate = CompressionCandidate(
+        let pngCandidate = CompressionCandidate(
             format: .png,
             url: candidateURL,
             byteCount: 1,
             ssim: 1,
             preset: .balanced
         )
+        item.pngCandidates = [pngCandidate]
+        item.selectedPNGCandidateID = pngCandidate.id
         item.selectedFormat = .png
         item.publishedURL = published
 
@@ -916,10 +1043,35 @@ struct CoreTests {
         defer { store.cleanup() }
         let itemID = UUID()
         let snapshot = try store.createSnapshot(sourceURL: source, itemID: itemID)
-        let vendoredRunner = ToolRunner(
-            toolsDirectory: URL(fileURLWithPath: "Vendor/bin", isDirectory: true)
+        let vendoredTools = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Vendor/bin", isDirectory: true)
+        let tools = base.appendingPathComponent("Tools", isDirectory: true)
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: false)
+        let pngquantArguments = base.appendingPathComponent("pngquant-arguments")
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            printf '%s\n' BEGIN "$@" >> '\(pngquantArguments.path)'
+            exec '\(vendoredTools.appendingPathComponent("pngquant").path)' "$@"
+            """,
+            to: tools.appendingPathComponent("pngquant")
         )
-        let result = try CompressionEngine(toolRunner: vendoredRunner).compress(
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            exec '\(vendoredTools.appendingPathComponent("oxipng").path)' "$@"
+            """,
+            to: tools.appendingPathComponent("oxipng")
+        )
+        for name in ["cjpegli", "jpegtran"] {
+            try FileManager.default.createSymbolicLink(
+                at: tools.appendingPathComponent(name),
+                withDestinationURL: vendoredTools.appendingPathComponent(name)
+            )
+        }
+        let vendoredRunner = ToolRunner(toolsDirectory: tools)
+        let engine = CompressionEngine(toolRunner: vendoredRunner)
+        let result = try engine.compress(
             snapshotURL: snapshot,
             itemID: itemID,
             generation: 1,
@@ -936,6 +1088,35 @@ struct CoreTests {
         )
         expect(result.jpegCandidate?.backend == .cjpegli, "opaque PNG uses bundled Jpegli")
         expect(result.pngCandidate?.ssim ?? 0 > 0.99, "lossless fallback remains faithful")
+        let initialPaletteCandidate = result.pngCandidates.first {
+            $0.pngPaletteMaximumColors == PNGPaletteCandidatePolicy.initialMaximumColors
+        }
+        expect(
+            initialPaletteCandidate?.backend == .pngquant,
+            "initial PNG compression records its real 256-color palette ceiling"
+        )
+        let initialArguments = try String(contentsOf: pngquantArguments, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        expect(
+            initialArguments.contains("0-100")
+                && initialArguments.contains("256")
+                && initialArguments.filter({ $0 == "BEGIN" }).count == 1,
+            "initial PNG compression invokes pngquant once with quality 0-100 and a 256-color ceiling"
+        )
+        let bestEffortPNG = try engine.recompress(
+            snapshotURL: snapshot,
+            itemID: itemID,
+            generation: 2,
+            format: .png,
+            quality: .preset(.balanced),
+            fileStore: store
+        )
+        expect(
+            bestEffortPNG.backend == .pngquant,
+            "high-color PNG uses best-effort pngquant instead of falling back "
+                + "(backend=\(bestEffortPNG.backend), ssim=\(bestEffortPNG.ssim))"
+        )
 
         let paletteURL = base.appendingPathComponent("palette-friendly.png")
         try makeTestPNG(
@@ -959,6 +1140,36 @@ struct CoreTests {
                 + "(backend=\(String(describing: paletteResult.pngCandidate?.backend)), "
                 + "failures=\(paletteResult.candidateFailureMessage ?? "none"))"
         )
+
+        let solidURL = base.appendingPathComponent("solid.png")
+        try makeTestPNG(
+            at: solidURL,
+            transparent: false,
+            frameCount: 1,
+            image: makeSolidImage(red: 220, green: 30, blue: 40, alpha: 255)
+        )
+        let solidID = UUID()
+        let solidSnapshot = try store.createSnapshot(sourceURL: solidURL, itemID: solidID)
+        let solidInitial = try engine.compress(
+            snapshotURL: solidSnapshot,
+            itemID: solidID,
+            generation: 1,
+            preset: .balanced,
+            fileStore: store
+        )
+        let solidGenerated = try engine.preparePNGPaletteCandidates(
+            snapshotURL: solidSnapshot,
+            itemID: solidID,
+            generation: 2,
+            existingCandidates: solidInitial.pngCandidates,
+            fileStore: store
+        )
+        let solidVisible = PNGPaletteCandidatePolicy.effectiveCandidates(
+            solidInitial.pngCandidates + solidGenerated,
+            originalByteCount: solidInitial.originalByteCount,
+            preserving: solidInitial.selectedFormat == .png ? solidInitial.selectedPNGCandidateID : nil
+        )
+        expect(solidVisible.count == 1, "a solid-color PNG exposes only one effective result")
 
         let displayP3URL = base.appendingPathComponent("display-p3.png")
         guard let displayP3 = CGColorSpace(name: CGColorSpace.displayP3) else {
@@ -1003,7 +1214,13 @@ struct CoreTests {
         }
 
         let transparentURL = base.appendingPathComponent("transparent.png")
-        try makeTestPNG(at: transparentURL, transparent: true, frameCount: 1)
+        try makeTestPNG(
+            at: transparentURL,
+            transparent: true,
+            frameCount: 1,
+            colorSpace: displayP3,
+            dpi: 144
+        )
         let transparentID = UUID()
         let transparentSnapshot = try store.createSnapshot(sourceURL: transparentURL, itemID: transparentID)
         let transparentResult = try CompressionEngine(toolRunner: vendoredRunner).compress(
@@ -1015,6 +1232,33 @@ struct CoreTests {
         )
         expect(transparentResult.hasTransparency, "transparent pixels are detected")
         expect(transparentResult.jpegCandidate == nil, "transparent PNG never generates JPEG")
+        let prepared = try engine.preparePNGPaletteCandidates(
+            snapshotURL: transparentSnapshot,
+            itemID: transparentID,
+            generation: 2,
+            existingCandidates: transparentResult.pngCandidates,
+            fileStore: store
+        )
+        expect(
+            Set(prepared.compactMap(\.pngPaletteMaximumColors)) == Set([64, 128, 192]),
+            "dynamic PNG preparation reuses 256 and generates the three missing budgets"
+        )
+        for candidate in prepared {
+            let preparedImage = try ImageDecoder.decode(candidate.url)
+            expect(candidate.backend == .pngquant, "dynamic PNG candidates never use ImageIO fallback")
+            expect(preparedImage.format == .png, "dynamic candidate remains PNG")
+            expect(
+                preparedImage.image.width == 512 && preparedImage.image.height == 384,
+                "dynamic candidate preserves pixel dimensions"
+            )
+            expect(preparedImage.hasTransparency, "dynamic candidate preserves transparent pixels")
+            expect(preparedImage.iccProfile != nil, "dynamic candidate preserves its ICC profile")
+            expect(
+                abs((preparedImage.dpiWidth ?? 0) - 144) < 0.5
+                    && abs((preparedImage.dpiHeight ?? 0) - 144) < 0.5,
+                "dynamic candidate preserves DPI"
+            )
+        }
 
         let animated = base.appendingPathComponent("animated.png")
         try makeTestPNG(at: animated, transparent: false, frameCount: 2)
@@ -1268,7 +1512,364 @@ struct CoreTests {
             preset: .balanced,
             fileStore: store
         )
-        expect(result.pngCandidate != nil, "a failing optional pngquant falls back to ImageIO")
+        expect(
+            result.pngCandidate?.backend == .imageIO,
+            "a failing optional pngquant falls back to ImageIO"
+        )
+    }
+
+    private static func opaquePNGCandidateBranchesRunConcurrentlyAndReuseSnapshot() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LitheParallelCandidates-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let tools = base.appendingPathComponent("Tools", isDirectory: true)
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: false)
+
+        let vendoredTools = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Vendor/bin", isDirectory: true)
+        let vendoredPNGQuant = vendoredTools.appendingPathComponent("pngquant")
+        let vendoredCJPEGli = vendoredTools.appendingPathComponent("cjpegli")
+        let pngStarted = base.appendingPathComponent("png-started")
+        let jpegStarted = base.appendingPathComponent("jpeg-started")
+        let pngSawPeer = base.appendingPathComponent("png-saw-peer")
+        let jpegSawPeer = base.appendingPathComponent("jpeg-saw-peer")
+        let pngInput = base.appendingPathComponent("png-input")
+        let jpegInput = base.appendingPathComponent("jpeg-input")
+
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            echo started > '\(pngStarted.path)'
+            last_argument=
+            for argument in "$@"; do last_argument="$argument"; done
+            printf '%s\\n' "$last_argument" > '\(pngInput.path)'
+            attempt=0
+            while [ ! -f '\(jpegStarted.path)' ] && [ "$attempt" -lt 200 ]; do
+                /bin/sleep 0.01
+                attempt=$((attempt + 1))
+            done
+            if [ -f '\(jpegStarted.path)' ]; then echo yes > '\(pngSawPeer.path)'; fi
+            exec '\(vendoredPNGQuant.path)' "$@"
+            """,
+            to: tools.appendingPathComponent("pngquant")
+        )
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            echo started > '\(jpegStarted.path)'
+            printf '%s\\n' "$1" > '\(jpegInput.path)'
+            attempt=0
+            while [ ! -f '\(pngStarted.path)' ] && [ "$attempt" -lt 200 ]; do
+                /bin/sleep 0.01
+                attempt=$((attempt + 1))
+            done
+            if [ -f '\(pngStarted.path)' ]; then echo yes > '\(jpegSawPeer.path)'; fi
+            exec '\(vendoredCJPEGli.path)' "$@"
+            """,
+            to: tools.appendingPathComponent("cjpegli")
+        )
+
+        let source = base.appendingPathComponent("opaque.png")
+        try makeTestPNG(
+            at: source,
+            transparent: false,
+            frameCount: 1,
+            image: makePaletteFriendlyImage()
+        )
+        let store = try SessionFileStore(baseDirectory: base)
+        defer { store.cleanup() }
+        let itemID = UUID()
+        let snapshot = source
+        let result = try CompressionEngine(toolRunner: ToolRunner(toolsDirectory: tools)).compress(
+            snapshotURL: snapshot,
+            itemID: itemID,
+            generation: 1,
+            preset: .balanced,
+            fileStore: store
+        )
+
+        expect(result.pngCandidate != nil && result.jpegCandidate != nil, "both opaque PNG candidates exist")
+        expect(
+            FileManager.default.fileExists(atPath: pngSawPeer.path)
+                && FileManager.default.fileExists(atPath: jpegSawPeer.path),
+            "independent PNG and JPEG candidate tools observe each other's handshake"
+        )
+        let recordedPNGInput = try String(contentsOf: pngInput, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let recordedJPEGInput = try String(contentsOf: jpegInput, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        expect(
+            recordedPNGInput == snapshot.path && recordedJPEGInput == snapshot.path,
+            "static orientation-one PNG snapshots are passed directly to both bundled tools"
+        )
+    }
+
+    private static func normalizedToolInputIsStableAcrossRecompression() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LitheNormalizedInput-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let tools = base.appendingPathComponent("Tools", isDirectory: true)
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: false)
+
+        let vendoredCJPEGli = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Vendor/bin/cjpegli")
+        let inputLog = base.appendingPathComponent("inputs")
+        let block = base.appendingPathComponent("block")
+        let blockedPID = base.appendingPathComponent("blocked-pid")
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            printf '%s\\n' "$1" >> '\(inputLog.path)'
+            if [ -f '\(block.path)' ]; then
+                echo "$$" > '\(blockedPID.path)'
+                exec /bin/sleep 10
+            fi
+            exec '\(vendoredCJPEGli.path)' "$@"
+            """,
+            to: tools.appendingPathComponent("cjpegli")
+        )
+
+        let source = base.appendingPathComponent("oriented.jpg")
+        try makeTestJPEG(at: source, dpi: 144, orientation: 6, quality: 0.9)
+        let store = try SessionFileStore(baseDirectory: base)
+        defer { store.cleanup() }
+        let itemID = UUID()
+        let snapshot = try store.createSnapshot(sourceURL: source, itemID: itemID)
+        let engine = CompressionEngine(toolRunner: ToolRunner(toolsDirectory: tools))
+
+        _ = try engine.compress(
+            snapshotURL: snapshot,
+            itemID: itemID,
+            generation: 1,
+            preset: .balanced,
+            fileStore: store
+        )
+        _ = try engine.recompress(
+            snapshotURL: snapshot,
+            itemID: itemID,
+            generation: 2,
+            format: .jpeg,
+            quality: .advanced(.six),
+            fileStore: store
+        )
+
+        var inputs = try String(contentsOf: inputLog, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        expect(inputs.count == 2 && inputs[0] == inputs[1], "normalized input path is stable across generations")
+        let normalizedInput = URL(fileURLWithPath: inputs[0])
+        let normalizedBytes = try Data(contentsOf: normalizedInput)
+        let normalizedDecoded = try ImageDecoder.decode(normalizedInput)
+        expect(
+            normalizedDecoded.format == .png && normalizedDecoded.sourceOrientation == 1,
+            "stable normalized input is a complete orientation-one PNG"
+        )
+
+        try Data("block".utf8).write(to: block)
+        let completion = DispatchSemaphore(value: 0)
+        let capturedError = CapturedError()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { completion.signal() }
+            do {
+                _ = try engine.recompress(
+                    snapshotURL: snapshot,
+                    itemID: itemID,
+                    generation: 3,
+                    format: .jpeg,
+                    quality: .advanced(.six),
+                    fileStore: store
+                )
+            } catch {
+                capturedError.store(error)
+            }
+        }
+        let blocked = waitForFile(at: blockedPID, timeout: 2)
+        engine.cancel(itemID: itemID)
+        let completed = completion.wait(timeout: .now() + 3) == .success
+        expect(blocked && completed, "cancelled recompression reaches and stops its bundled tool")
+        expect(isCancellation(capturedError.load()), "cancelled recompression reports cancellation")
+        expect(
+            (try? Data(contentsOf: normalizedInput)) == normalizedBytes,
+            "cancellation cannot replace the reusable normalized input with partial data"
+        )
+        _ = try ImageDecoder.decode(normalizedInput)
+
+        try FileManager.default.removeItem(at: block)
+        _ = try engine.recompress(
+            snapshotURL: snapshot,
+            itemID: itemID,
+            generation: 4,
+            format: .jpeg,
+            quality: .advanced(.six),
+            fileStore: store
+        )
+        inputs = try String(contentsOf: inputLog, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        expect(inputs.count == 4 && inputs.allSatisfy { $0 == inputs[0] }, "Inspector recompression reuses one normalized input")
+
+        let itemDirectory = try store.itemDirectory(for: itemID)
+        let leftovers = try FileManager.default.contentsOfDirectory(
+            at: itemDirectory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasPrefix(".normalized-input-") }
+        expect(leftovers.isEmpty, "cancelled normalization leaves no reusable partial file")
+    }
+
+    private static func dynamicPNGPalettePreparationHandlesFailuresAndCancellation() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LitheDynamicPNG-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let tools = base.appendingPathComponent("Tools", isDirectory: true)
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: false)
+        let vendoredTools = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Vendor/bin", isDirectory: true)
+        let pngquantURL = tools.appendingPathComponent("pngquant")
+        let oxipngURL = tools.appendingPathComponent("oxipng")
+        try writeExecutableScript(
+            "#!/bin/sh\nexec '\(vendoredTools.appendingPathComponent("pngquant").path)' \"$@\"\n",
+            to: pngquantURL
+        )
+        try writeExecutableScript(
+            "#!/bin/sh\nexec '\(vendoredTools.appendingPathComponent("oxipng").path)' \"$@\"\n",
+            to: oxipngURL
+        )
+
+        let source = base.appendingPathComponent("source.png")
+        try makeTestPNG(at: source, transparent: true, frameCount: 1)
+        let store = try SessionFileStore(baseDirectory: base)
+        defer { store.cleanup() }
+        let itemID = UUID()
+        let snapshot = try store.createSnapshot(sourceURL: source, itemID: itemID)
+        let engine = CompressionEngine(toolRunner: ToolRunner(toolsDirectory: tools))
+        let initial = try engine.compress(
+            snapshotURL: snapshot,
+            itemID: itemID,
+            generation: 1,
+            preset: .balanced,
+            fileStore: store
+        )
+        expect(
+            initial.pngCandidates.contains { $0.pngPaletteMaximumColors == 256 },
+            "dynamic failure fixture starts with a reusable 256-color candidate"
+        )
+
+        let budgetLog = base.appendingPathComponent("budgets")
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            for arg in "$@"; do
+                case "$arg" in
+                    64|128|192|256) printf '%s\n' "$arg" >> '\(budgetLog.path)' ;;
+                esac
+                if [ "$arg" = "64" ]; then exit 1; fi
+            done
+            exec '\(vendoredTools.appendingPathComponent("pngquant").path)' "$@"
+            """,
+            to: pngquantURL
+        )
+        let partial = try engine.preparePNGPaletteCandidates(
+            snapshotURL: snapshot,
+            itemID: itemID,
+            generation: 2,
+            existingCandidates: initial.pngCandidates,
+            fileStore: store
+        )
+        expect(
+            Set(partial.compactMap(\.pngPaletteMaximumColors)) == Set([128, 192]),
+            "one failed palette probe is skipped while successful probes remain available"
+        )
+        let budgets = try String(contentsOf: budgetLog, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        expect(budgets == ["192", "128", "64"], "dynamic probes run serially in the fixed missing-budget order")
+
+        try writeExecutableScript("#!/bin/sh\nexit 1\n", to: pngquantURL)
+        expectThrows("all failed palette probes report preparation failure") {
+            _ = try engine.preparePNGPaletteCandidates(
+                snapshotURL: snapshot,
+                itemID: itemID,
+                generation: 3,
+                existingCandidates: initial.pngCandidates,
+                fileStore: store
+            )
+        }
+        expect(
+            FileManager.default.fileExists(atPath: initial.pngCandidate?.url.path ?? ""),
+            "all failed probes leave the current PNG result untouched"
+        )
+
+        try writeExecutableScript(
+            "#!/bin/sh\nexec '\(vendoredTools.appendingPathComponent("pngquant").path)' \"$@\"\n",
+            to: pngquantURL
+        )
+        try writeExecutableScript("#!/bin/sh\nexit 1\n", to: oxipngURL)
+        expectThrows("OxiPNG failure does not create an ImageIO dynamic replacement") {
+            _ = try engine.preparePNGPaletteCandidates(
+                snapshotURL: snapshot,
+                itemID: itemID,
+                generation: 4,
+                existingCandidates: initial.pngCandidates,
+                fileStore: store
+            )
+        }
+
+        let started = base.appendingPathComponent("dynamic-started")
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            for arg in "$@"; do
+                if [ "$arg" = "192" ]; then
+                    printf started > '\(started.path)'
+                    exec /bin/sleep 10
+                fi
+            done
+            exec '\(vendoredTools.appendingPathComponent("pngquant").path)' "$@"
+            """,
+            to: pngquantURL
+        )
+        try writeExecutableScript(
+            "#!/bin/sh\nexec '\(vendoredTools.appendingPathComponent("oxipng").path)' \"$@\"\n",
+            to: oxipngURL
+        )
+        let completion = DispatchSemaphore(value: 0)
+        let capturedError = CapturedError()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { completion.signal() }
+            do {
+                _ = try engine.preparePNGPaletteCandidates(
+                    snapshotURL: snapshot,
+                    itemID: itemID,
+                    generation: 5,
+                    existingCandidates: initial.pngCandidates,
+                    fileStore: store
+                )
+            } catch {
+                capturedError.store(error)
+            }
+        }
+        expect(waitForFile(at: started, timeout: 2), "dynamic cancellation reaches the active probe")
+        engine.cancel(itemID: itemID, generation: 5)
+        expect(
+            completion.wait(timeout: .now() + 3) == .success,
+            "dynamic cancellation stops the active probe promptly"
+        )
+        expect(isCancellation(capturedError.load()), "dynamic preparation propagates cancellation")
+        for maximumColors in [128, 64] {
+            let output = try store.candidateURL(
+                itemID: itemID,
+                format: .png,
+                generation: 5,
+                variant: "palette-\(maximumColors)"
+            )
+            expect(
+                !FileManager.default.fileExists(atPath: output.path),
+                "cancellation does not start the remaining \(maximumColors)-color probe"
+            )
+        }
     }
 
     private static func compressionCancellationStopsFallbackPipeline() throws {
@@ -1294,7 +1895,7 @@ struct CoreTests {
             to: tools.appendingPathComponent("oxipng")
         )
         try writeExecutableScript(
-            "#!/bin/sh\necho invoked > '\(cjpegliStarted.path)'\nexit 1\n",
+            "#!/bin/sh\necho \"$$\" > '\(cjpegliStarted.path)'\nexec /bin/sleep 10\n",
             to: tools.appendingPathComponent("cjpegli")
         )
 
@@ -1328,10 +1929,11 @@ struct CoreTests {
             }
         }
 
-        let started = waitForFile(at: pngquantStarted, timeout: 2)
+        let pngStarted = waitForFile(at: pngquantStarted, timeout: 5)
+        let jpegStarted = waitForFile(at: cjpegliStarted, timeout: 5)
         engine.cancel()
         let completed = completion.wait(timeout: .now() + 3) == .success
-        expect(started, "compression cancellation fixture reaches the first bundled tool")
+        expect(pngStarted && jpegStarted, "compression cancellation fixture reaches both parallel tools")
         expect(completed, "compression cancellation returns promptly")
         expect(isCancellation(capturedError.load()), "compression reports cancellation")
         expect(
@@ -1343,8 +1945,8 @@ struct CoreTests {
             "cancelled pngquant does not start oxipng"
         )
         expect(
-            !FileManager.default.fileExists(atPath: cjpegliStarted.path),
-            "cancelled PNG compression does not start the JPEG candidate"
+            FileManager.default.fileExists(atPath: cjpegliStarted.path),
+            "opaque PNG starts the independent JPEG candidate before cancellation"
         )
     }
 
@@ -1354,6 +1956,26 @@ struct CoreTests {
             arguments: ["50000", "1", "50000"]
         )
         expect(result.standardOutput.count > 100_000, "large stdout is drained without a pipe deadlock")
+    }
+
+    private static func toolRunnerPreflightCancellationDoesNotLaunch() throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LitheToolPreflight-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        do {
+            _ = try ToolRunner().run(
+                executableURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "echo started > \"$1\"", "lithe-preflight", marker.path],
+                cancellationCheck: { true }
+            )
+            expect(false, "preflight-cancelled ToolRunner call throws")
+        } catch {
+            expect(isCancellation(error), "preflight cancellation reports cancellation")
+        }
+        expect(
+            !FileManager.default.fileExists(atPath: marker.path),
+            "preflight cancellation prevents the child from launching"
+        )
     }
 
     private static func toolRunnerCancellationReapsChild() throws {
@@ -1399,6 +2021,55 @@ struct CoreTests {
         errno = 0
         let probe = Darwin.kill(pid, 0)
         expect(probe == -1 && errno == ESRCH, "cancelled child is reaped instead of orphaned")
+    }
+
+    private static func toolRunnerCancellationReapsConcurrentChildren() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LitheToolConcurrentCancel-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let pidURLs = [base.appendingPathComponent("pid-1"), base.appendingPathComponent("pid-2")]
+        let errors = [CapturedError(), CapturedError()]
+        let runner = ToolRunner()
+        let group = DispatchGroup()
+
+        for index in pidURLs.indices {
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { group.leave() }
+                do {
+                    _ = try runner.run(
+                        executableURL: URL(fileURLWithPath: "/bin/sh"),
+                        arguments: [
+                            "-c",
+                            "echo \"$$\" > \"$1\"; exec /bin/sleep 10",
+                            "lithe-concurrent-cancel-test",
+                            pidURLs[index].path,
+                        ]
+                    )
+                } catch {
+                    errors[index].store(error)
+                }
+            }
+        }
+
+        let bothStarted = pidURLs.allSatisfy { waitForFile(at: $0, timeout: 2) }
+        runner.cancel()
+        let completed = group.wait(timeout: .now() + 3) == .success
+        expect(bothStarted, "both concurrent ToolRunner children start")
+        expect(completed, "one cancellation wakes and reaps every concurrent ToolRunner child")
+        expect(errors.allSatisfy { isCancellation($0.load()) }, "all concurrent runs report cancellation")
+
+        for pidURL in pidURLs {
+            guard let pidText = try? String(contentsOf: pidURL, encoding: .utf8),
+                  let pid = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                expect(false, "concurrent cancellation fixture records every PID")
+                return
+            }
+            errno = 0
+            let probe = Darwin.kill(pid, 0)
+            expect(probe == -1 && errno == ESRCH, "every concurrently cancelled child is reaped")
+        }
     }
 
     private static func toolRunnerTimesOutAndReaps() {

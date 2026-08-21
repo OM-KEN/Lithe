@@ -12,10 +12,8 @@ This file tracks confirmed unfinished work, not promised release dates.<br>
 - [ ] Make the result-panel Check button open the first item marked `建议检查` when nothing is selected.
 - [ ] Show a compact `建议检查` badge beside the filename in the inspector and preserve previous/next navigation.
 - [ ] Let eligible `无需压缩` items enter the inspector and try advanced quality levels without losing the original or last valid result.
-- [ ] Add regression coverage for externally optimized JPEGs, partial candidate failures, and review-state navigation.
+- [ ] Add regression coverage for externally optimized JPEGs and review-state navigation.
 
 ## Release Quality / 发布质量
 
 - [ ] Complete hands-on validation for multi-display positioning, drag-out conflicts, ZIP, Trash/Undo, and caller integration.
-- [ ] Measure launch and compression latency against the MVP performance targets.
-- [ ] Recheck GPL corresponding-source materials and every bundled dependency notice for the exact release build.

@@ -243,7 +243,9 @@ final class SessionCoordinator: @unchecked Sendable {
             item.inputFormat = result.inputFormat
             item.hasTransparency = result.hasTransparency
             item.originalByteCount = result.originalByteCount
-            item.pngCandidate = result.pngCandidate
+            item.pngCandidates = result.pngCandidates
+            item.selectedPNGCandidateID = result.selectedPNGCandidateID
+            item.pngPreparationState = .idle
             item.jpegCandidate = result.jpegCandidate
             item.selectedFormat = result.selectedFormat
             item.reviewRecommended = result.reviewRecommended
@@ -269,7 +271,9 @@ final class SessionCoordinator: @unchecked Sendable {
             item.inputFormat = result.inputFormat
             item.hasTransparency = result.hasTransparency
             item.originalByteCount = result.originalByteCount
-            item.pngCandidate = result.pngCandidate
+            item.pngCandidates = result.pngCandidates
+            item.selectedPNGCandidateID = result.selectedPNGCandidateID
+            item.pngPreparationState = .idle
             item.jpegCandidate = result.jpegCandidate
             item.selectedFormat = nil
             item.generationFailureMessage = result.candidateFailureMessage
@@ -346,7 +350,11 @@ final class SessionCoordinator: @unchecked Sendable {
             previous: { [weak self] in self?.moveInspector(by: -1) },
             next: { [weak self] in self?.moveInspector(by: 1) },
             selectCandidate: { [weak self] format in self?.publishExistingCandidate(format: format) },
-            recompress: { [weak self] quality in self?.recompressCurrentItem(quality: quality) }
+            recompress: { [weak self] quality in self?.recompressCurrentItem(quality: quality) },
+            preparePNGPaletteCandidates: { [weak self] in self?.preparePNGPaletteCandidates() },
+            selectPNGCandidate: { [weak self] candidateID in
+                self?.publishPNGCandidate(candidateID: candidateID)
+            }
         )
     }
 
@@ -369,6 +377,9 @@ final class SessionCoordinator: @unchecked Sendable {
     }
 
     private func inspectorDidClose() {
+        if let itemID = model.inspectorItemID {
+            cancelPNGPreparation(itemID: itemID)
+        }
         inspectorController = nil
         model.inspectorItemID = nil
         model.activities.remove(.inspector)
@@ -382,8 +393,121 @@ final class SessionCoordinator: @unchecked Sendable {
         guard !values.isEmpty,
               let current = model.inspectorItemID,
               let index = values.firstIndex(where: { $0.id == current }) else { return }
+        cancelPNGPreparation(itemID: current)
         let next = (index + delta + values.count) % values.count
         model.inspectorItemID = values[next].id
+    }
+
+    private func preparePNGPaletteCandidates() {
+        guard let itemID = model.inspectorItemID,
+              let item = model.item(id: itemID),
+              let snapshotURL = item.snapshotURL,
+              item.pngCandidate != nil,
+              item.pngPreparationState != .preparing else { return }
+        do {
+            try fileStore.ensureTemporaryCapacity(for: [snapshotURL], safetyMultiplier: 5)
+        } catch {
+            item.pngPreparationState = .failed(error.localizedDescription)
+            return
+        }
+
+        let preparationGeneration = item.beginPNGPreparation()
+        let existingCandidates = item.pngCandidates
+        let originalByteCount = item.originalByteCount
+        item.pngPreparationState = .preparing
+        autoCloseTimer?.invalidate()
+
+        worker.async { [weak self] in
+            guard let self else { return }
+            do {
+                let generated = try self.compressionEngine.preparePNGPaletteCandidates(
+                    snapshotURL: snapshotURL,
+                    itemID: itemID,
+                    generation: preparationGeneration,
+                    existingCandidates: existingCandidates,
+                    fileStore: self.fileStore
+                )
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.finishPNGPalettePreparation(
+                            itemID: itemID,
+                            generation: preparationGeneration,
+                            originalByteCount: originalByteCount,
+                            existingCandidates: existingCandidates,
+                            generatedCandidates: generated,
+                            error: nil
+                        )
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self.finishPNGPalettePreparation(
+                            itemID: itemID,
+                            generation: preparationGeneration,
+                            originalByteCount: originalByteCount,
+                            existingCandidates: existingCandidates,
+                            generatedCandidates: [],
+                            error: error
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func finishPNGPalettePreparation(
+        itemID: UUID,
+        generation: Int,
+        originalByteCount: Int64,
+        existingCandidates: [CompressionCandidate],
+        generatedCandidates: [CompressionCandidate],
+        error: Error?
+    ) {
+        guard let item = model.item(id: itemID),
+              item.pngPreparationGeneration == generation,
+              item.pngPreparationState == .preparing else { return }
+        if let error {
+            if Self.isCompressionCancellation(error) {
+                item.pngPreparationState = .idle
+            } else {
+                item.pngPreparationState = .failed(error.localizedDescription)
+            }
+            return
+        }
+        let candidates = PNGPaletteCandidatePolicy.effectiveCandidates(
+            existingCandidates + generatedCandidates,
+            originalByteCount: originalByteCount,
+            preserving: item.selectedFormat == .png ? item.selectedPNGCandidateID : nil
+        )
+        if !candidates.isEmpty {
+            item.pngCandidates = candidates
+            if item.selectedPNGCandidateID.flatMap({ selectedID in
+                candidates.first { $0.id == selectedID }
+            }) == nil {
+                item.selectedPNGCandidateID = candidates.last?.id
+            }
+        } else if item.selectedFormat != .png {
+            item.pngCandidates = []
+            item.selectedPNGCandidateID = nil
+        }
+        item.pngPreparationState = .ready
+    }
+
+    private func cancelPNGPreparation(itemID: UUID) {
+        guard let item = model.item(id: itemID),
+              item.pngPreparationState == .preparing else { return }
+        let generation = item.pngPreparationGeneration
+        _ = item.beginPNGPreparation()
+        item.pngPreparationState = .idle
+        compressionEngine.cancel(itemID: itemID, generation: generation)
+    }
+
+    private nonisolated static func isCompressionCancellation(_ error: Error) -> Bool {
+        if case CompressionEngineError.cancelled = error { return true }
+        if let toolError = error as? ToolRunnerError,
+           case .cancelled = toolError { return true }
+        return false
     }
 
     private func recompressCurrentItem(quality: CompressionQuality) {
@@ -393,6 +517,7 @@ final class SessionCoordinator: @unchecked Sendable {
               let format = item.selectedFormat ?? item.pngCandidate?.format ?? item.jpegCandidate?.format else {
             return
         }
+        cancelPNGPreparation(itemID: id)
         compressionEngine.cancel(itemID: id)
         let generation = generationGate.begin(itemID: id)
         guard generation >= 0 else { return }
@@ -479,6 +604,20 @@ final class SessionCoordinator: @unchecked Sendable {
               let item = model.item(id: id),
               item.selectedFormat != format,
               let candidate = format == .png ? item.pngCandidate : item.jpegCandidate else { return }
+        publishExistingCandidate(candidate, itemID: id)
+    }
+
+    private func publishPNGCandidate(candidateID: UUID) {
+        guard let id = model.inspectorItemID,
+              let item = model.item(id: id),
+              let candidate = item.pngCandidates.first(where: { $0.id == candidateID }),
+              item.selectedFormat != .png || item.selectedPNGCandidateID != candidateID else { return }
+        publishExistingCandidate(candidate, itemID: id)
+    }
+
+    private func publishExistingCandidate(_ candidate: CompressionCandidate, itemID id: UUID) {
+        guard let item = model.item(id: id) else { return }
+        cancelPNGPreparation(itemID: id)
         compressionEngine.cancel(itemID: id)
         let generation = generationGate.begin(itemID: id)
         guard generation >= 0 else { return }
@@ -509,7 +648,7 @@ final class SessionCoordinator: @unchecked Sendable {
                         try self.fileStore.republish(
                             candidateURL: candidate.url,
                             sourceURL: sourceURL,
-                            format: format,
+                            format: candidate.format,
                             currentPublishedURL: currentURL,
                             currentFingerprint: currentFingerprint,
                             fixedDestinationDirectory: destination
@@ -605,7 +744,12 @@ final class SessionCoordinator: @unchecked Sendable {
         }
         guard let candidate, let publication else { return }
         if candidate.format == .png {
-            item.pngCandidate = candidate
+            if let index = item.pngCandidates.firstIndex(where: { $0.id == candidate.id }) {
+                item.pngCandidates[index] = candidate
+            } else {
+                item.pngCandidates.append(candidate)
+            }
+            item.selectedPNGCandidateID = candidate.id
         } else {
             item.jpegCandidate = candidate
         }
@@ -614,7 +758,7 @@ final class SessionCoordinator: @unchecked Sendable {
         item.publishedFingerprint = publication.1
         item.preservedOldOutput = publication.preservedOldOutput
         item.generationFailureMessage = nil
-        item.reviewRecommended = false
+        item.reviewRecommended = candidate.isBelowReferenceQuality
         item.thumbnail = NSImage(contentsOf: candidate.url)
         item.status = .ready
         if publication.preservedOldOutput {

@@ -101,7 +101,6 @@ enum LitheImageFormat: String, Codable, CaseIterable, Sendable {
 
 struct QualityEncodingParameters: Equatable, Sendable {
     let jpegQualityPercent: Int
-    let pngQualityRange: ClosedRange<Int>
     let referenceSSIM: Double
 
     var jpegQuality: Double { Double(jpegQualityPercent) / 100 }
@@ -121,16 +120,16 @@ enum QualityLevel: Int, Codable, CaseIterable, Sendable {
 
     var parameters: QualityEncodingParameters {
         switch self {
-        case .one: .init(jpegQualityPercent: 68, pngQualityRange: 55 ... 70, referenceSSIM: 0.78)
-        case .two: .init(jpegQualityPercent: 76, pngQualityRange: 65 ... 78, referenceSSIM: 0.80)
-        case .three: .init(jpegQualityPercent: 80, pngQualityRange: 72 ... 84, referenceSSIM: 0.83)
-        case .four: .init(jpegQualityPercent: 84, pngQualityRange: 80 ... 90, referenceSSIM: 0.85)
-        case .five: .init(jpegQualityPercent: 87, pngQualityRange: 80 ... 92, referenceSSIM: 0.88)
-        case .six: .init(jpegQualityPercent: 90, pngQualityRange: 80 ... 95, referenceSSIM: 0.90)
-        case .seven: .init(jpegQualityPercent: 92, pngQualityRange: 85 ... 97, referenceSSIM: 0.93)
-        case .eight: .init(jpegQualityPercent: 94, pngQualityRange: 90 ... 100, referenceSSIM: 0.95)
-        case .nine: .init(jpegQualityPercent: 95, pngQualityRange: 93 ... 100, referenceSSIM: 0.97)
-        case .ten: .init(jpegQualityPercent: 96, pngQualityRange: 96 ... 100, referenceSSIM: 0.98)
+        case .one: .init(jpegQualityPercent: 68, referenceSSIM: 0.78)
+        case .two: .init(jpegQualityPercent: 76, referenceSSIM: 0.80)
+        case .three: .init(jpegQualityPercent: 80, referenceSSIM: 0.83)
+        case .four: .init(jpegQualityPercent: 84, referenceSSIM: 0.85)
+        case .five: .init(jpegQualityPercent: 87, referenceSSIM: 0.88)
+        case .six: .init(jpegQualityPercent: 90, referenceSSIM: 0.90)
+        case .seven: .init(jpegQualityPercent: 92, referenceSSIM: 0.93)
+        case .eight: .init(jpegQualityPercent: 94, referenceSSIM: 0.95)
+        case .nine: .init(jpegQualityPercent: 95, referenceSSIM: 0.97)
+        case .ten: .init(jpegQualityPercent: 96, referenceSSIM: 0.98)
         }
     }
 }
@@ -150,10 +149,6 @@ enum QualityPreset: String, Codable, CaseIterable, Sendable {
 
     var jpegQuality: Double {
         qualityLevel.parameters.jpegQuality
-    }
-
-    var pngQualityRange: ClosedRange<Int> {
-        qualityLevel.parameters.pngQualityRange
     }
 
     var minimumSSIM: Double {
@@ -223,6 +218,13 @@ struct CompressionCandidate: Identifiable, Sendable {
     let ssim: Double
     let quality: CompressionQuality
     let backend: CompressionBackend
+    let pngPaletteMaximumColors: Int?
+
+    var isBelowReferenceQuality: Bool {
+        ssim < (format == .png
+            ? PNGPaletteCandidatePolicy.referenceSSIM
+            : quality.level.parameters.referenceSSIM)
+    }
 
     init(
         id: UUID = UUID(),
@@ -231,7 +233,8 @@ struct CompressionCandidate: Identifiable, Sendable {
         byteCount: Int64,
         ssim: Double,
         quality: CompressionQuality,
-        backend: CompressionBackend = .imageIO
+        backend: CompressionBackend = .imageIO,
+        pngPaletteMaximumColors: Int? = nil
     ) {
         self.id = id
         self.format = format
@@ -240,6 +243,7 @@ struct CompressionCandidate: Identifiable, Sendable {
         self.ssim = ssim
         self.quality = quality
         self.backend = backend
+        self.pngPaletteMaximumColors = pngPaletteMaximumColors
     }
 
     init(
@@ -249,7 +253,8 @@ struct CompressionCandidate: Identifiable, Sendable {
         byteCount: Int64,
         ssim: Double,
         preset: QualityPreset,
-        backend: CompressionBackend = .imageIO
+        backend: CompressionBackend = .imageIO,
+        pngPaletteMaximumColors: Int? = nil
     ) {
         self.init(
             id: id,
@@ -258,7 +263,8 @@ struct CompressionCandidate: Identifiable, Sendable {
             byteCount: byteCount,
             ssim: ssim,
             quality: .preset(preset),
-            backend: backend
+            backend: backend,
+            pngPaletteMaximumColors: pngPaletteMaximumColors
         )
     }
 }
@@ -348,6 +354,64 @@ enum CompressionPolicy {
     }
 }
 
+enum PNGPaletteCandidatePolicy {
+    static let maximumColors = [64, 128, 192, 256]
+    static let additionalPreparationOrder = [192, 128, 64]
+    static let initialMaximumColors = 256
+    static let referenceSSIM = 0.98
+
+    static func effectiveCandidates(
+        _ candidates: [CompressionCandidate],
+        originalByteCount: Int64,
+        preserving preservedCandidateID: UUID?
+    ) -> [CompressionCandidate] {
+        func isEligible(_ candidate: CompressionCandidate) -> Bool {
+            candidate.format == .png
+                && candidate.byteCount > 0
+                && (candidate.byteCount < originalByteCount || candidate.id == preservedCandidateID)
+        }
+
+        var paletteByMaximumColors: [Int: CompressionCandidate] = [:]
+        for candidate in candidates where isEligible(candidate) {
+            guard let maximumColors = candidate.pngPaletteMaximumColors,
+                  Self.maximumColors.contains(maximumColors) else { continue }
+            if let existing = paletteByMaximumColors[maximumColors] {
+                if existing.id == preservedCandidateID { continue }
+                if candidate.id == preservedCandidateID || candidate.byteCount < existing.byteCount {
+                    paletteByMaximumColors[maximumColors] = candidate
+                }
+            } else {
+                paletteByMaximumColors[maximumColors] = candidate
+            }
+        }
+
+        var ordered = paletteByMaximumColors.values.sorted {
+            ($0.pngPaletteMaximumColors ?? 0) < ($1.pngPaletteMaximumColors ?? 0)
+        }
+        if let preservedCandidateID,
+           let preserved = candidates.first(where: { $0.id == preservedCandidateID }),
+           isEligible(preserved),
+           preserved.pngPaletteMaximumColors == nil {
+            ordered.append(preserved)
+        }
+        guard let clearest = ordered.last else { return [] }
+
+        var retainedFromRight = [clearest]
+        var previousRetained = clearest
+        for candidate in ordered.dropLast().reversed() {
+            if candidate.id == preservedCandidateID
+                || CompressionPolicy.hasEffectiveSaving(
+                    originalBytes: previousRetained.byteCount,
+                    resultBytes: candidate.byteCount
+                ) {
+                retainedFromRight.append(candidate)
+                previousRetained = candidate
+            }
+        }
+        return retainedFromRight.reversed()
+    }
+}
+
 enum ExplicitRecompressionPolicy {
     static func accepts(originalBytes: Int64, resultBytes: Int64) -> Bool {
         originalBytes > 0 && resultBytes > 0 && resultBytes < originalBytes
@@ -358,11 +422,17 @@ struct CompressionResult: Sendable {
     let inputFormat: LitheImageFormat
     let hasTransparency: Bool
     let originalByteCount: Int64
-    let pngCandidate: CompressionCandidate?
+    let pngCandidates: [CompressionCandidate]
+    let selectedPNGCandidateID: UUID?
     let jpegCandidate: CompressionCandidate?
     let selectedFormat: LitheImageFormat?
     let reviewRecommended: Bool
     let candidateFailureMessage: String?
+
+    var pngCandidate: CompressionCandidate? {
+        guard let selectedPNGCandidateID else { return pngCandidates.last }
+        return pngCandidates.first { $0.id == selectedPNGCandidateID } ?? pngCandidates.last
+    }
 
     var selectedCandidate: CompressionCandidate? {
         switch selectedFormat {
@@ -371,6 +441,13 @@ struct CompressionResult: Sendable {
         case nil: nil
         }
     }
+}
+
+enum PNGCandidatePreparationState: Equatable, Sendable {
+    case idle
+    case preparing
+    case ready
+    case failed(String)
 }
 
 enum SessionItemStatus: Equatable, Sendable {

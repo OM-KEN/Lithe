@@ -131,13 +131,13 @@ final class SessionFileStore: @unchecked Sendable {
         }
     }
 
-    func ensureTemporaryCapacity(for sources: [URL]) throws {
+    func ensureTemporaryCapacity(for sources: [URL], safetyMultiplier: Int64 = 3) throws {
         let required = sources.reduce(Int64(0)) { partial, url in
             partial + ((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0)
         }
         let values = try rootURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         let available = values.volumeAvailableCapacityForImportantUsage ?? Int64.max
-        let safetyRequirement = max(required * 3, 32 * 1_024 * 1_024)
+        let safetyRequirement = max(required * max(1, safetyMultiplier), 32 * 1_024 * 1_024)
         guard available >= safetyRequirement else {
             throw FileLifecycleError.insufficientTemporarySpace(
                 required: safetyRequirement,
@@ -148,8 +148,17 @@ final class SessionFileStore: @unchecked Sendable {
 
     func itemDirectory(for id: UUID) throws -> URL {
         let url = rootURL.appendingPathComponent(id.uuidString, isDirectory: true)
-        if !fileManager.fileExists(atPath: url.path) {
+        var isDirectory = ObjCBool(false)
+        if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            guard isDirectory.boolValue else { throw FileLifecycleError.invalidFile(url) }
+            return url
+        }
+        do {
             try fileManager.createDirectory(at: url, withIntermediateDirectories: false)
+        } catch {
+            var createdDirectory = ObjCBool(false)
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &createdDirectory),
+                  createdDirectory.boolValue else { throw error }
         }
         return url
     }
@@ -177,6 +186,18 @@ final class SessionFileStore: @unchecked Sendable {
         return try itemDirectory(for: itemID)
             .appendingPathComponent("candidate-\(generation)\(suffix)")
             .appendingPathExtension(format.fileExtension)
+    }
+
+    func normalizedInputURL(itemID: UUID) throws -> URL {
+        try itemDirectory(for: itemID)
+            .appendingPathComponent("normalized-input")
+            .appendingPathExtension(LitheImageFormat.png.fileExtension)
+    }
+
+    func temporaryNormalizedInputURL(itemID: UUID) throws -> URL {
+        try itemDirectory(for: itemID)
+            .appendingPathComponent(".normalized-input-\(UUID().uuidString)")
+            .appendingPathExtension(LitheImageFormat.png.fileExtension)
     }
 
     func publishInitial(

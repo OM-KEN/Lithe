@@ -120,6 +120,7 @@ esac
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR/Tools" "$RESOURCES_DIR/Licenses"
 
 COMMON_SWIFTC_ARGS=(
+    -O
     -framework AppKit
     -framework SwiftUI
     -framework ImageIO

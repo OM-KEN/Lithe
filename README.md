@@ -4,14 +4,15 @@
 
 Lithe is a lightweight image compressor for macOS. It automatically compresses JPG and PNG files, while keeping detailed comparison tools available when you need them.
 
-[Download Lithe 1.0.0](https://github.com/OM-KEN/Lithe/releases/download/v1.0.0/Lithe-1.0.0.dmg) · Requires macOS 14 or later
+[Download Lithe 1.1.0](https://github.com/OM-KEN/Lithe/releases/download/v1.1.0/Lithe-1.1.0.dmg) · Requires macOS 14 or later
 
 ## Features
 
 - Compress static JPG and PNG files.
 - Compare PNG and JPEG results for opaque PNGs.
 - Inspect images with synchronized zooming and panning.
-- Fine-tune quality with three presets or a 10-level control.
+- Fine-tune JPEG quality with three presets or a 10-level control.
+- For PNG, prepare up to four content-dependent results and hide size-equivalent choices.
 - Drag out results, reveal them in Finder, create ZIP files, or move originals to Trash with session undo.
 - Keep originals safe with immutable snapshots and non-destructive output.
 
